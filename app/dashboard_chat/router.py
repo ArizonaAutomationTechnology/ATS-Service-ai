@@ -17,6 +17,50 @@ from app.dashboard_chat.plan_executor import execute_plan
 
 router = APIRouter(prefix="/api/assistant/admin", tags=["dashboard-chat"])
 
+SOURCE_LABELS = {
+    "search_tickets": "Ticket Registration",
+    "get_ticket_history": "Ticket Registration",
+    "get_dashboard_counts": "Dashboard",
+    "get_priority_counts": "Dashboard",
+    "get_project_ticket_counts": "Project Management",
+    "get_user_workloads": "Dashboard",
+    "list_organizations": "Organization",
+    "list_departments": "Department",
+    "list_designations": "Designation",
+    "search_employees": "Employee",
+    "search_projects": "Project Management",
+    "search_clients": "CRM",
+    "search_changes": "Change Tracker",
+    "search_documents": "ShareDoc",
+    "get_file_log_summary": "ShareDoc",
+}
+
+
+def response_metadata(tool_results: list[Dict[str, Any]], args: Dict[str, Any]) -> tuple[list[str], Dict[str, Any]]:
+    sources = list(dict.fromkeys(
+        SOURCE_LABELS.get(result.get("tool"), result.get("tool"))
+        for result in tool_results
+        if result.get("type") == "tool_result"
+    ))
+    filters = {
+        key: value for key, value in args.items()
+        if value is not None and key not in {"pageIndex", "pageSize"} and not key.startswith("_")
+    }
+    return sources, filters
+
+
+def conversation_recap(message: str, state: ConversationState) -> Optional[str]:
+    lower = message.lower()
+    if not any(phrase in lower for phrase in ("what did we discuss", "what did we say", "previous conversation")):
+        return None
+    prior_questions = [turn.text for turn in state.recentTurns if turn.role == "user"]
+    if not prior_questions:
+        return "We have not discussed anything in this chat yet."
+    topic_words = {word for word in lower.replace("?", "").split() if len(word) > 3} - {"what", "discuss", "previous", "conversation"}
+    relevant = [question for question in prior_questions if not topic_words or any(word in question.lower() for word in topic_words)]
+    questions = (relevant or prior_questions)[-3:]
+    return "Previously, you asked about:\n" + "\n".join(f"- {question}" for question in questions)
+
 
 def format_grouped_summary(data: Dict[str, Any]) -> Dict[str, Any]:
     groups = data.get("groups") or []
@@ -35,7 +79,7 @@ def format_grouped_summary(data: Dict[str, Any]) -> Dict[str, Any]:
     if not groups:
         return {
             "message": f"I found {total_count} matching tickets, but there was no {label} value to group.",
-            "suggestions": ["Try another date range", "Group by user", "Group by category"],
+            # "suggestions": ["Try another date range", "Group by user", "Group by category"],
         }
 
     top = groups[0]
@@ -50,7 +94,7 @@ def format_grouped_summary(data: Dict[str, Any]) -> Dict[str, Any]:
             f"Overall, I found **{total_count}** matching tickets. Breakdown by {label}:\n"
             + "\n".join(f"- {line}" for line in lines)
         ),
-        "suggestions": ["Show ticket list", "Group by assignee", "Only high priority"],
+        # "suggestions": ["Show ticket list", "Group by assignee", "Only high priority"],
     }
 
 
@@ -62,12 +106,12 @@ def format_monthly_ticket_count(data: Dict[str, Any]) -> Dict[str, Any]:
     if month and year and count is not None:
         return {
             "message": f"I found **{count}** tickets raised in **{month} {year}**.",
-            "suggestions": ["Show current raised tickets", "Show this month", "Show overdue tickets"],
+            # "suggestions": ["Show current raised tickets", "Show this month", "Show overdue tickets"],
         }
 
     return {
         "message": "I could not identify a single month for this ticket count. Please ask for a specific month and year.",
-        "suggestions": ["May 2026", "This month", "Last month"],
+        # "suggestions": ["May 2026", "This month", "Last month"],
     }
 
 
@@ -84,7 +128,7 @@ def format_ticket_count(data: Dict[str, Any], args: Dict[str, Any]) -> Dict[str,
     label = f" with status **{status_value}**" if status_value else ""
     return {
         "message": f"I found **{total}** tickets{label}.",
-        "suggestions": ["Show ticket list", "Group by project", "Group by assignee"],
+        # "suggestions": ["Show ticket list", "Group by project", "Group by assignee"],
     }
 
 async def resolve_lookup_ids(
@@ -149,6 +193,7 @@ async def dashboard_chat(request: DashboardChatRequest):
     conversation_id = request.conversationId
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
+    trace_id = str(uuid.uuid4())
 
     state = state_store.get(conversation_id)
     if not state:
@@ -157,6 +202,21 @@ async def dashboard_chat(request: DashboardChatRequest):
             userId=request.userId,
             entityId=request.entityId,
             blockId=request.blockId
+        )
+    elif (state.userId, state.entityId, state.blockId) != (request.userId, request.entityId, request.blockId):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Conversation does not belong to this user scope.")
+
+    recap = conversation_recap(request.message, state)
+    if recap is not None:
+        state_store.add_turn(state, "user", request.message)
+        state_store.add_turn(state, "assistant", recap)
+        state_store.set(conversation_id, state)
+        return DashboardChatResponse(
+            conversationId=conversation_id,
+            traceId=trace_id,
+            type="answer",
+            message=recap,
+            sources=["Conversation"],
         )
 
     # Convert state to dict for LLM planning context
@@ -168,18 +228,23 @@ async def dashboard_chat(request: DashboardChatRequest):
         "lastResultKind": state.lastResultKind,
         "lastResponseFormat": state.lastResponseFormat,
         "pageIndex": state.pageIndex,
+        "summary": state.summary,
+        "recentTurns": [turn.model_dump() for turn in state.recentTurns[-10:]],
     }
 
     # 3. Ask the LLM for a dynamic tool plan instead of a fixed intent.
     plan = await run_planner_chain(request.message, prev_state_dict)
 
     if plan.get("needs_clarification"):
+        state_store.add_turn(state, "user", request.message)
+        state_store.add_turn(state, "assistant", plan.get("clarification_question") or "Please clarify your request.")
         state_store.set(conversation_id, state)
         return DashboardChatResponse(
             conversationId=conversation_id,
+            traceId=trace_id,
             type="clarification",
             message=plan.get("clarification_question") or "Please clarify your request.",
-            suggestions=plan.get("suggestions") or ["This month", "Last month", "This week"]
+            # suggestions=plan.get("suggestions") or ["This month", "Last month", "This week"]
         )
 
     # Follow-up paging: reuse previous args and increment page index.
@@ -195,32 +260,37 @@ async def dashboard_chat(request: DashboardChatRequest):
             user_id=request.userId,
             entity_id=request.entityId,
             block_id=request.blockId,
+            trace_id=trace_id,
         )
     except Exception as e:
         return DashboardChatResponse(
             conversationId=conversation_id,
             type="answer",
-            message=f"I could not fetch ticket data right now. Please try again. (Details: {str(e)})",
-            suggestions=["Retry"]
+            message="I could not fetch the requested data right now. Please try again.",
+            # suggestions=["Retry"]
         )
 
     for result in tool_results:
         if result.get("type") == "clarification":
+            state_store.add_turn(state, "user", request.message)
+            state_store.add_turn(state, "assistant", result.get("message", "Please clarify your request."))
             state_store.set(conversation_id, state)
             return DashboardChatResponse(
                 conversationId=conversation_id,
+                traceId=trace_id,
                 type="clarification",
                 message=result.get("message", "Please clarify your request."),
-                suggestions=result.get("suggestions") or ["This month", "Last month", "This week"]
+                # suggestions=result.get("suggestions") or ["This month", "Last month", "This week"]
             )
 
     if not tool_results:
+        state_store.add_turn(state, "user", request.message)
         state_store.set(conversation_id, state)
         return DashboardChatResponse(
             conversationId=conversation_id,
             type="answer",
             message="I can help with tickets, projects, users, workload, and dashboard analytics. What would you like to check?",
-            suggestions=["Show overdue tickets", "Project health", "User workload"]
+            # suggestions=["Show overdue tickets", "Project health", "User workload"]
         )
 
     failed_result = next((result for result in reversed(tool_results) if result.get("type") == "error"), None)
@@ -229,7 +299,7 @@ async def dashboard_chat(request: DashboardChatRequest):
             conversationId=conversation_id,
             type="answer",
             message=failed_result.get("message", "I could not complete that request."),
-            suggestions=failed_result.get("suggestions") or ["Try again"],
+            # suggestions=failed_result.get("suggestions") or ["Try again"],
         )
 
     final_result = next((r for r in reversed(tool_results) if r.get("type") == "tool_result"), tool_results[-1])
@@ -261,6 +331,8 @@ async def dashboard_chat(request: DashboardChatRequest):
     state.lastArgs = executed_state.get("lastArgs") or {}
     state.lastResponseFormat = plan.get("response_format") or kind
     state.pageIndex = int(state.lastArgs.get("pageIndex") or state.pageIndex or 1)
+    state_store.add_turn(state, "user", request.message)
+    state_store.add_turn(state, "assistant", answer_res.get("message", "Here are the results."))
     state_store.set(conversation_id, state)
 
     if kind == "ticket_list" and tool_data:
@@ -277,10 +349,15 @@ async def dashboard_chat(request: DashboardChatRequest):
             "result": tool_data
         }
 
+    sources, applied_filters = response_metadata(tool_results, final_result.get("args") or {})
+
     return DashboardChatResponse(
         conversationId=conversation_id,
+        traceId=trace_id,
         type="answer",
         message=answer_res.get("message", "Here are the results."),
         data=res_data,
-        suggestions=answer_res.get("suggestions")
+        # suggestions=answer_res.get("suggestions"),
+        sources=sources,
+        appliedFilters=applied_filters,
     )

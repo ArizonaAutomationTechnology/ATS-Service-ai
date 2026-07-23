@@ -31,9 +31,13 @@ class TicketListData(BaseModel):
 
 class DashboardChatResponse(BaseModel):
     conversationId: str
+    traceId: Optional[str] = Field(default=None, description="Trace ID for sanitized tool-call logs")
     type: str = Field(..., description="Response type: 'clarification' or 'answer'")
     message: str
     data: Optional[Dict[str, Any]] = Field(default=None, description="Structured payload like ticket list, counts, etc.")
+    # suggestions: Optional[List[str]] = Field(default=None, description="Safe follow-up questions returned from tool data")
+    sources: Optional[List[str]] = Field(default=None, description="Business areas used to answer the question")
+    appliedFilters: Optional[Dict[str, Any]] = Field(default=None, description="Filters applied to the source data")
 
 class FiltersState(BaseModel):
     status: Optional[str] = None
@@ -48,6 +52,10 @@ class ToolCallState(BaseModel):
     tool: str
     args: Dict[str, Any] = Field(default_factory=dict)
 
+class ConversationTurn(BaseModel):
+    role: str
+    text: str
+
 class ConversationState(BaseModel):
     conversationId: str
     userId: str
@@ -61,3 +69,5 @@ class ConversationState(BaseModel):
     lastTool: Optional[str] = None
     lastArgs: Dict[str, Any] = Field(default_factory=dict)
     lastResponseFormat: Optional[str] = None
+    summary: str = ""
+    recentTurns: List[ConversationTurn] = Field(default_factory=list)

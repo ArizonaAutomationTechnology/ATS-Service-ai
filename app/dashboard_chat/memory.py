@@ -1,6 +1,8 @@
 import threading
 from typing import Dict, Optional
-from app.dashboard_chat.schemas import ConversationState
+from app.dashboard_chat.schemas import ConversationState, ConversationTurn
+
+MAX_RECENT_TURNS = 10
 
 class ConversationStateStore:
     def __init__(self):
@@ -19,6 +21,14 @@ class ConversationStateStore:
         with self._lock:
             if conversation_id in self._states:
                 del self._states[conversation_id]
+
+    def add_turn(self, state: ConversationState, role: str, text: str) -> None:
+        state.recentTurns.append(ConversationTurn(role=role, text=text[:1000]))
+        if len(state.recentTurns) > MAX_RECENT_TURNS:
+            older = state.recentTurns[:-MAX_RECENT_TURNS]
+            topics = "; ".join(turn.text[:140] for turn in older if turn.role == "user")
+            state.summary = (state.summary + ("; " if state.summary and topics else "") + topics)[-1000:]
+            state.recentTurns = state.recentTurns[-MAX_RECENT_TURNS:]
 
 # Global state store instance for the application
 state_store = ConversationStateStore()

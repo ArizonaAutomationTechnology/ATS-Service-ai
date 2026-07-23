@@ -12,7 +12,7 @@ Rules:
 1. Refer ONLY to the provided API Data. Do NOT invent counts, names, or ticket details.
 2. If the data is a paginated list of tickets, mention the total count found and what subset is currently shown. E.g., "I found 34 overdue tickets for July 2026. Here are the first 30."
 3. Keep the response message concise, brief, and formatted in markdown.
-4. Provide 2-3 short suggestions (e.g. "Show next 30", "Only high priority", "Group by project", "Show bottleneck users").
+4. For CRM client details, provide only Name, Email, Contact, and Address when those fields are present. Never mention database IDs, created dates, or internal IDs.
 
 Output strictly as a JSON object, with NO other text before or after:
 {{
@@ -52,10 +52,10 @@ async def run_answer_chain(query: str, intent: str, filters: Dict[str, Any], api
             page_size = api_data.get("pageSize", 30) if isinstance(api_data, dict) else 30
             return {
                 "message": f"I found {total} overdue tickets. Here are the first {min(total, page_size)}.",
-                "suggestions": ["Show next 20", "Only high priority", "Group by project"]
+                # "suggestions": ["Show next 20", "Only high priority", "Group by project"]
             }
         else:
             return {
                 "message": "Here is the raw data matching your query.",
-                "suggestions": ["Show overdue tickets", "Summarize this week"]
+                # "suggestions": ["Show overdue tickets", "Summarize this week"]
             }

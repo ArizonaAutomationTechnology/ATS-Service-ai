@@ -9,6 +9,16 @@ from app.dashboard_chat.tools.dashboard_tools import get_dashboard_counts, get_p
 from app.dashboard_chat.tools.project_tools import get_active_categories, get_active_projects, get_project_ticket_counts
 from app.dashboard_chat.tools.ticket_tools import get_ticket_history, get_tickets
 from app.dashboard_chat.tools.user_tools import get_active_users, get_user_workloads
+from app.dashboard_chat.tools.organization_tools import (
+    get_changes,
+    get_clients,
+    get_departments,
+    get_designations,
+    get_employees,
+    get_file_logs,
+    get_organizations,
+    get_project_documents,
+)
 
 
 ToolHandler = Callable[..., Awaitable[Any]]
@@ -78,6 +88,60 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
         "returns": "grouped_ticket_summary",
         "guardrails": "Requires a previous search_tickets result in the same plan or conversation.",
     },
+    {
+        "name": "list_organizations",
+        "description": "List organizations available to the current user.",
+        "args": ["name"],
+        "returns": "organization_list",
+    },
+    {
+        "name": "list_departments",
+        "description": "List active departments or find a department by name.",
+        "args": ["name"],
+        "returns": "department_list",
+    },
+    {
+        "name": "list_designations",
+        "description": "List active designations or find a designation by name.",
+        "args": ["name"],
+        "returns": "designation_list",
+    },
+    {
+        "name": "search_employees",
+        "description": "Find active employees by name, department, or designation.",
+        "args": ["name", "departmentName", "designationName"],
+        "returns": "employee_list",
+    },
+    {
+        "name": "search_projects",
+        "description": "Find active projects by project or client name.",
+        "args": ["name", "clientName"],
+        "returns": "project_list",
+    },
+    {
+        "name": "search_clients",
+        "description": "Find CRM clients by name, contact, or email.",
+        "args": ["name"],
+        "returns": "client_list",
+    },
+    {
+        "name": "search_changes",
+        "description": "Find Change Tracker entries by project, client, status, or keyword.",
+        "args": ["keyword", "projectName", "clientName", "status", "dateRangeText"],
+        "returns": "change_list",
+    },
+    {
+        "name": "search_documents",
+        "description": "List ShareDoc folders for one resolved project. Ask for the project when it is missing or ambiguous.",
+        "args": ["projectName", "projectId"],
+        "returns": "document_list",
+    },
+    {
+        "name": "get_file_log_summary",
+        "description": "List ShareDoc file open/close log entries, optionally filtered by keyword.",
+        "args": ["keyword"],
+        "returns": "file_log_list",
+    },
 ]
 
 
@@ -100,15 +164,68 @@ def _contains_name(candidate: Dict[str, Any], query: Optional[str], keys: List[s
     return False
 
 
+def _filter_rows(rows: List[Dict[str, Any]], *terms: Optional[str]) -> List[Dict[str, Any]]:
+    terms = tuple(_norm(term) for term in terms if term)
+    if not terms:
+        return rows[:25]
+    return [
+        row for row in rows
+        if all(term in " ".join(str(value or "") for value in row.values()).lower() for term in terms)
+    ][:25]
+
+
+def _compact_row(row: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    if kind == "client_list":
+        values = {key.lower(): value for key, value in row.items()}
+        return {
+            label: values[key]
+            for label, key in {
+                "name": "name",
+                "email": "email",
+                "contact": "contact",
+                "address": "address",
+            }.items()
+            if values.get(key) not in (None, "")
+        }
+
+    allowed = {
+        "id", "name", "entityname", "organizationname", "departmentname",
+        "designationname", "username", "employeeid", "empid", "projectname",
+        "clientname", "contactperson", "status", "createddate", "createdbyname",
+        "changetrackerno", "projectid", "clientid", "foldername", "filename",
+        "filepath", "action", "openedbyname", "closedbyname",
+    }
+    compact = {
+        key: value for key, value in row.items()
+        if key.lower() in allowed and value not in (None, "")
+    }
+    return compact or {"id": row.get("id") or row.get("Id"), "name": row.get("name") or row.get("Name")}
+
+
+def _list_result(tool_name: str, kind: str, args: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    compact_rows = [_compact_row(row, kind) for row in rows[:25]]
+    return {
+        "type": "tool_result",
+        "tool": tool_name,
+        "kind": kind,
+        "args": args,
+        "data": {"totalCount": len(rows), "returnedCount": len(compact_rows), "records": compact_rows},
+    }
+
+
 async def resolve_lookup_ids(entity_id: str, block_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
     resolved = dict(args)
 
     if args.get("projectName") and not args.get("projectId"):
         projects = await get_active_projects(entity_id, block_id)
-        for project in projects:
-            if _contains_name(project, args.get("projectName"), ["name", "projectName"]):
-                resolved["projectId"] = project.get("id") or project.get("projectId")
-                break
+        matches = [project for project in projects if _contains_name(project, args.get("projectName"), ["name", "projectName"])]
+        if len(matches) == 1:
+            resolved["projectId"] = matches[0].get("id") or matches[0].get("projectId")
+        elif len(matches) > 1:
+            resolved["_projectMatches"] = [
+                project.get("name") or project.get("projectName") or "Unnamed project"
+                for project in matches[:5]
+            ]
 
     if args.get("userName") and not args.get("assignedTo"):
         users = await get_active_users(entity_id, block_id)
@@ -283,7 +400,7 @@ async def execute_tool(
             return {
                 "type": "clarification",
                 "message": "Which date range should I use for this ticket search?",
-                "suggestions": ["This month", "Last month", "This week", "Today"],
+                # "suggestions": ["This month", "Last month", "This week", "Today"],
             }
 
         result = await get_tickets(
@@ -316,7 +433,7 @@ async def execute_tool(
             return {
                 "type": "clarification",
                 "message": "Please provide the ticket number or open a specific ticket first.",
-                "suggestions": ["Search by ticket number", "Show overdue tickets"],
+                # "suggestions": ["Search by ticket number", "Show overdue tickets"],
             }
         return {
             "type": "tool_result",
@@ -429,13 +546,13 @@ async def execute_tool(
             return {
                 "type": "clarification",
                 "message": "Please search for tickets first, then I can group those results.",
-                "suggestions": ["Show overdue tickets this month", "Show high priority tickets this week"],
+                # "suggestions": ["Show overdue tickets this month", "Show high priority tickets this week"],
             }
         if not is_complete:
             return {
                 "type": "error",
                 "message": "I could not retrieve a complete ticket set, so I will not report an inaccurate grouped count.",
-                "suggestions": ["Try again", "Use a shorter date range"],
+                # "suggestions": ["Try again", "Use a shorter date range"],
             }
         groups: Dict[str, int] = {}
         for ticket in tickets:
@@ -456,8 +573,51 @@ async def execute_tool(
             },
         }
 
+    if tool_name == "list_organizations":
+        return _list_result(tool_name, "organization_list", args, _filter_rows(await get_organizations(), args.get("name")))
+
+    if tool_name == "list_departments":
+        return _list_result(tool_name, "department_list", args, _filter_rows(await get_departments(entity_id, block_id), args.get("name")))
+
+    if tool_name == "list_designations":
+        return _list_result(tool_name, "designation_list", args, _filter_rows(await get_designations(entity_id, block_id), args.get("name")))
+
+    if tool_name == "search_employees":
+        rows = await get_employees(entity_id, block_id)
+        return _list_result(tool_name, "employee_list", args, _filter_rows(rows, args.get("name"), args.get("departmentName"), args.get("designationName")))
+
+    if tool_name == "search_projects":
+        rows = await get_active_projects(entity_id, block_id)
+        return _list_result(tool_name, "project_list", args, _filter_rows(rows, args.get("name"), args.get("clientName")))
+
+    if tool_name == "search_clients":
+        return _list_result(tool_name, "client_list", args, _filter_rows(await get_clients(entity_id, block_id), args.get("name")))
+
+    if tool_name == "search_changes":
+        rows = await get_changes(entity_id, block_id)
+        return _list_result(tool_name, "change_list", args, _filter_rows(rows, args.get("keyword"), args.get("projectName"), args.get("clientName"), args.get("status")))
+
+    if tool_name == "search_documents":
+        args = await resolve_lookup_ids(entity_id, block_id, args)
+        if args.get("_projectMatches"):
+            return {
+                "type": "clarification",
+                "message": "I found more than one matching project. Which one do you mean?",
+                # "suggestions": args["_projectMatches"],
+            }
+        if not args.get("projectId"):
+            return {
+                "type": "clarification",
+                "message": "Which project should I use to find its ShareDoc folders?",
+                # "suggestions": ["Provide a project name", "List active projects"],
+            }
+        return _list_result(tool_name, "document_list", args, await get_project_documents(args.get("projectId")))
+
+    if tool_name == "get_file_log_summary":
+        return _list_result(tool_name, "file_log_list", args, _filter_rows(await get_file_logs(entity_id, block_id), args.get("keyword")))
+
     return {
         "type": "error",
         "message": f"Unsupported tool: {tool_name}",
-        "suggestions": ["Show overdue tickets", "Project health", "User workload"],
+        # "suggestions": ["Show overdue tickets", "Project health", "User workload"],
     }

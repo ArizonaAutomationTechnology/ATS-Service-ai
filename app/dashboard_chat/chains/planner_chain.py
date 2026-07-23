@@ -8,7 +8,7 @@ from app.dashboard_chat.tool_registry import get_tool_catalog_for_prompt
 from app.services.llm_service import call_llm_async
 
 
-PLANNER_TEMPLATE = """You are a planning assistant for a ticketing management system.
+PLANNER_TEMPLATE = """You are a planning assistant for an organization-wide operations system.
 Your job is to convert the user's natural-language request into a safe JSON tool plan.
 
 You are NOT limited to fixed intents. Pick one or more tools from the catalog.
@@ -33,13 +33,14 @@ Planning rules:
 10. A ticket status such as Overdue, ReOpen, In Process, Closed, Completed, Raised, or Rejected is a valid narrowing filter for grouped/count questions, even without a date range.
 11. If the user asks how many tickets were raised/created in a month, use get_dashboard_counts with metric="monthly_volume" and the dateRangeText so the count matches Monthly Volume Intake. Only use status="Raised" when they ask for tickets currently/now in the Raised state.
 12. If the user asks for a vague "all tickets" query with no date range, status, or narrow filter, ask for a date range.
-13. If the request is unrelated to tickets, projects, users, workload, or dashboard analytics, ask how you can help with ticket data.
+13. Use the organization, department, designation, employee, project, CRM, ShareDoc, and Change Tracker tools whenever the question is about those business areas. Do not route them to ticket tools.
+14. The current ASP.NET API has no employee-performance read API. If the user asks for performance, explain that performance data is not available in this chat yet; never guess or calculate it from tickets.
+15. If a ShareDoc request does not identify one project, ask which project to use. If an entity name is ambiguous, ask the user to choose.
 
 Output schema:
 {{
   "needs_clarification": true or false,
   "clarification_question": string or null,
-  "suggestions": [string],
   "tool_calls": [
     {{
       "tool": "tool_name_from_catalog",
@@ -192,7 +193,7 @@ def _rule_based_person_status_plan(message: str) -> Optional[Dict[str, Any]]:
     return {
         "needs_clarification": False,
         "clarification_question": None,
-        "suggestions": [],
+        # "suggestions": [],
         "tool_calls": [
             {
                 "tool": "search_tickets",
@@ -214,7 +215,7 @@ def _rule_based_raised_count_plan(message: str) -> Optional[Dict[str, Any]]:
         return {
             "needs_clarification": False,
             "clarification_question": None,
-            "suggestions": [],
+            # "suggestions": [],
             "tool_calls": [
                 {
                     "tool": "search_tickets",
@@ -232,7 +233,7 @@ def _rule_based_raised_count_plan(message: str) -> Optional[Dict[str, Any]]:
     return {
         "needs_clarification": False,
         "clarification_question": None,
-        "suggestions": [],
+        # "suggestions": [],
         "tool_calls": [
             {
                 "tool": "get_dashboard_counts",
@@ -266,7 +267,7 @@ def _rule_based_analytical_plan(message: str) -> Optional[Dict[str, Any]]:
     return {
         "needs_clarification": False,
         "clarification_question": None,
-        "suggestions": [],
+        # "suggestions": [],
         "tool_calls": [
             {
                 "tool": "search_tickets",
@@ -286,11 +287,20 @@ def _rule_based_analytical_plan(message: str) -> Optional[Dict[str, Any]]:
 
 def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     lower = message.lower()
+    if "performance" in lower:
+        return {
+            "needs_clarification": True,
+            "clarification_question": "Employee performance data is not available through the current read-only API yet.",
+            # "suggestions": ["Show employee workload", "Show overdue tickets by employee"],
+            "tool_calls": [],
+            "response_format": "clarification",
+            "isNextPageRequest": False,
+        }
     if "next" in lower and previous_state and previous_state.get("lastTool"):
         return {
             "needs_clarification": False,
             "clarification_question": None,
-            "suggestions": [],
+            # "suggestions": [],
             "tool_calls": [
                 {
                     "tool": previous_state.get("lastTool"),
@@ -323,7 +333,7 @@ def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Di
             return {
                 "needs_clarification": True,
                 "clarification_question": "Which date range should I use for this ticket search?",
-                "suggestions": ["This month", "Last month", "This week", "Today"],
+                # "suggestions": ["This month", "Last month", "This week", "Today"],
                 "tool_calls": [],
                 "response_format": "clarification",
                 "isNextPageRequest": False,
@@ -332,7 +342,7 @@ def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Di
         return {
             "needs_clarification": False,
             "clarification_question": None,
-            "suggestions": [],
+            # "suggestions": [],
             "tool_calls": [
                 {
                     "tool": "search_tickets",
@@ -351,7 +361,7 @@ def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Di
     return {
         "needs_clarification": True,
         "clarification_question": "I can help with tickets, projects, users, workload, and dashboard analytics. What would you like to check?",
-        "suggestions": ["Show overdue tickets", "Project health", "User workload", "Ticket counts"],
+        # "suggestions": ["Show overdue tickets", "Project health", "User workload", "Ticket counts"],
         "tool_calls": [],
         "response_format": "clarification",
         "isNextPageRequest": False,
@@ -374,6 +384,9 @@ async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any
     if person_status_plan:
         return person_status_plan
 
+    if "performance" in message.lower():
+        return _fallback_plan(message, previous_state)
+
     prompt = planner_prompt.format(
         message=message,
         conversation_state=json.dumps(previous_state, default=str),
@@ -389,7 +402,7 @@ async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any
             data["tool_calls"] = []
         data.setdefault("needs_clarification", False)
         data.setdefault("clarification_question", None)
-        data.setdefault("suggestions", [])
+        # data.setdefault("suggestions", [])
         data.setdefault("response_format", "summary")
         data.setdefault("isNextPageRequest", False)
         return data

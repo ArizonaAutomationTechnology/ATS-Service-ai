@@ -11,11 +11,8 @@ Include 3-4 typical examples/choices in the question itself.
 
 Output strictly as a JSON object, with NO other text before or after:
 {{
-  "message": "Clarification question text",
-  "suggestions": ["suggestion 1", "suggestion 2", "suggestion 3", "suggestion 4"]
+  "message": "Clarification question text"
 }}
-
-Examples of date range suggestions: ["This month", "Last month", "This week", "Today"]
 
 Answer:"""
 
@@ -36,15 +33,15 @@ async def run_clarification_chain(intent: str, missing_filter: str) -> Dict[str,
         if missing_filter == "dateRange":
             return {
                 "message": "For which period should I check overdue tickets: this month, last month, this week, or a custom range?",
-                "suggestions": ["This month", "Last month", "This week", "Today"]
+                # "suggestions": ["This month", "Last month", "This week", "Today"]
             }
         elif missing_filter == "projectOrDateRange":
             return {
                 "message": "Please specify a project name or a date range (e.g. LIMS, this month) to check project health.",
-                "suggestions": ["LIMS Project", "This month", "This week"]
+                # "suggestions": ["LIMS Project", "This month", "This week"]
             }
         else:
             return {
                 "message": f"Could you please specify the {missing_filter}?",
-                "suggestions": []
+                # "suggestions": []
             }
