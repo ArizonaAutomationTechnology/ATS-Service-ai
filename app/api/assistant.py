@@ -1,7 +1,14 @@
 import re
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
+from difflib import SequenceMatcher
+from pathlib import Path
+import tempfile
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
+from app.config import settings
 from app.database import get_db
 from app.models.schemas import (
     PromptRequest, 
@@ -11,23 +18,149 @@ from app.models.schemas import (
     AdminAssistantResponse,
     SimilarTicketsRequest,
     SimilarTicketsResponse,
-    SimilarTicketMatch
+    SimilarTicketMatch,
+    AudioDescriptionResponse,
 )
-from app.services import ticket_service, prompt_service, llm_service, nl2sql_service
+from app.services import ticket_service, prompt_service, llm_service, nl2sql_service, speech_service
 
 
 router = APIRouter(prefix="/api/assistant", tags=["assistant"])
+logger = logging.getLogger("uvicorn.error")
+
+_AUDIO_SUFFIXES = {
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-wav": ".wav",
+}
+_DESCRIPTION_SCHEMA = {
+    "type": "object",
+    "properties": {"description": {"type": "string"}},
+    "required": ["description"],
+    "additionalProperties": False,
+}
+_ASSIGNMENT_WORDS = (
+    "assign",
+    "assignment",
+    "allocate",
+    "allocation",
+    "delegate",
+    "delegation",
+    "recommend",
+    "recommendation",
+    "suggest",
+    "suggestion",
+    "suitable",
+    "candidate",
+    "employee",
+    "people",
+)
+
+
+def needs_employee_context(prompt: str) -> bool:
+    """Return whether a ticket question needs the employee directory."""
+    prompt_lower = prompt.lower()
+    words = re.findall(r"[a-z]+", prompt_lower)
+    return (
+        any(word in _ASSIGNMENT_WORDS for word in words)
+        or "who should" in prompt_lower
+        or "who to" in prompt_lower
+        or (
+            any(word in {"who", "whom"} for word in words)
+            and any(word in {"ticket", "task", "issue"} for word in words)
+        )
+        or any(
+            # Accept one-character typos such as "asign" without broadening the
+            # request to unrelated ticket-summary prompts.
+            len(word) >= 5 and any(
+                SequenceMatcher(None, word, assignment_word).ratio() >= 0.8
+                for assignment_word in _ASSIGNMENT_WORDS
+            )
+            for word in words
+        )
+    )
+
+
+async def save_temporary_audio(audio: UploadFile) -> Path:
+    content_type = (audio.content_type or "").lower()
+    suffix = _AUDIO_SUFFIXES.get(content_type)
+    if not suffix:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Upload an MP3, M4A, OGG, WAV, or WebM audio file.",
+        )
+
+    temporary_path: Path | None = None
+    total_bytes = 0
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            while chunk := await audio.read(64 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > settings.MAX_AUDIO_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="The audio recording exceeds the allowed file size.",
+                    )
+                temporary_file.write(chunk)
+        if total_bytes == 0:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The audio recording is empty.")
+        return temporary_path
+    except Exception:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await audio.close()
+
+
+@router.post("/ticket-description/from-audio", response_model=AudioDescriptionResponse)
+async def create_ticket_description_from_audio(
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+    project_context: str | None = Form(None),
+):
+    """Translate uploaded speech and return a user-reviewable ticket description draft."""
+    temporary_path: Path | None = None
+    try:
+        temporary_path = await save_temporary_audio(audio)
+        translation = await run_in_threadpool(speech_service.translate_audio, temporary_path, language)
+    except speech_service.SpeechServiceError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    finally:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)
+
+    warnings: list[str] = []
+    polished_description: str | None = None
+    try:
+        prompt = prompt_service.format_ticket_description_polish_prompt(translation.text, project_context)
+        result = await llm_service.call_llm_json_async(prompt, _DESCRIPTION_SCHEMA)
+        description = result.get("description")
+        if not isinstance(description, str) or not description.strip():
+            raise llm_service.LlmServiceError("Ollama returned an empty ticket description.")
+        polished_description = description.strip()
+    except llm_service.LlmServiceError as exc:
+        logger.warning("Ticket-description polishing unavailable: %s", exc)
+        warnings.append("Translation succeeded, but description polishing is temporarily unavailable.")
+
+    return AudioDescriptionResponse(
+        status="success" if polished_description else "partial_success",
+        detectedLanguage=translation.detected_language,
+        languageConfidence=translation.language_confidence,
+        translatedText=translation.text,
+        polishedDescription=polished_description,
+        warnings=warnings,
+    )
 
 @router.post("/ask", response_model=AssistantResponse)
 async def ask_assistant(request: PromptRequest, db: Session = Depends(get_db)):
-    # 1. Scan user prompt for employee or assignment matching keywords
+    # 1. Scan user prompt for employee or assignment intent.
     # If the user is just summarizing the ticket description, we do NOT load the employee directory.
     # This prevents sending 41 employee records to the context window, dramatically speeding up CPU inference.
-    prompt_lower = request.prompt.lower()
-    needs_employees = any(
-        kw in prompt_lower 
-        for kw in ["assign", "recommend", "suggest", "suitable", "who should", "who to", "allocation", "employee", "people"]
-    )
+    needs_employees = needs_employee_context(request.prompt)
 
     # 2. Retrieve ticket details (synchronous call, FastAPI executes this in a threadpool)
     ticket = ticket_service.get_ticket_details(db, request.ticket_id)
@@ -167,5 +300,3 @@ async def ask_admin_assistant(request: AdminPromptRequest, db: Session = Depends
 #     """
 #     response_text = await nl2sql_service.execute_natural_query(db, request.prompt)
 #     return AssistantResponse(text=response_text, status="success")
-
-

@@ -8,7 +8,7 @@ from app.dashboard_chat.services.date_parser import parse_date_range
 from app.dashboard_chat.tools.dashboard_tools import get_dashboard_counts, get_priority_counts, get_ticket_count_month_wise
 from app.dashboard_chat.tools.project_tools import get_active_categories, get_active_projects, get_project_ticket_counts
 from app.dashboard_chat.tools.ticket_tools import get_ticket_history, get_tickets
-from app.dashboard_chat.tools.user_tools import get_active_users, get_user_workloads
+from app.dashboard_chat.tools.user_tools import get_active_users, get_employee_performance, get_user_workloads
 from app.dashboard_chat.tools.organization_tools import (
     get_changes,
     get_clients,
@@ -62,6 +62,13 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
         "description": "Fetch user/employee workload counts for overloaded user or bottleneck questions.",
         "args": ["userName", "assignedTo"],
         "returns": "user_workload",
+    },
+    {
+        "name": "get_employee_performance",
+        "description": "Summarize one employee's work activity and dashboard ticket metrics for a supplied date range.",
+        "args": ["userName", "dateRangeText"],
+        "returns": "employee_performance",
+        "guardrails": "Requires one employee and a date range. For 'this year', query from 1 January through today.",
     },
     {
         "name": "get_active_projects",
@@ -494,6 +501,44 @@ async def execute_tool(
             "kind": "user_workload",
             "args": args,
             "data": data,
+        }
+
+    if tool_name == "get_employee_performance":
+        user_name = str(args.get("userName") or "").strip()
+        if not user_name:
+            return {
+                "type": "clarification",
+                "message": "Which employee's performance should I summarize?",
+            }
+        users = await get_active_users(entity_id, block_id)
+        matches = [user for user in users if _contains_name(user, user_name, ["name", "userName", "empId"])]
+        if len(matches) != 1:
+            return {
+                "type": "clarification",
+                "message": "I could not identify one employee. Please provide the full employee name.",
+            }
+        start_date, end_date = parse_date_range(str(args.get("dateRangeText") or ""))
+        today = datetime.date.today().isoformat()
+        if not start_date or not end_date:
+            return {
+                "type": "clarification",
+                "message": "Which period should I use for this performance summary?",
+            }
+        end_date = min(end_date, today)
+        if start_date > end_date:
+            return {
+                "type": "clarification",
+                "message": "That performance period is in the future. Please choose a period up to today.",
+            }
+        employee = matches[0]
+        employee_id = employee.get("id") or employee.get("userId")
+        employee_name = employee.get("name") or employee.get("userName") or user_name
+        return {
+            "type": "tool_result",
+            "tool": tool_name,
+            "kind": "employee_performance",
+            "args": {**args, "userName": employee_name, "startDate": start_date, "endDate": end_date},
+            "data": await get_employee_performance(employee_id, employee_name, start_date, end_date),
         }
 
     if tool_name == "get_active_projects":

@@ -115,6 +115,50 @@ def format_monthly_ticket_count(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def format_employee_performance(data: Dict[str, Any]) -> Dict[str, Any]:
+    tickets = data.get("tickets") or {}
+    total = int(tickets.get("totalTickets") or 0)
+    raised = int(tickets.get("raisedTickets") or 0)
+    pending_close = int(tickets.get("pendingToCloseTickets") or 0)
+    pending_server = int(tickets.get("pendingOnServer") or 0)
+
+    if not total:
+        return {
+            "message": (
+                f"I found no ticket activity for **{data.get('employeeName')}** "
+                f"between **{data.get('startDate')} and {data.get('endDate')}**."
+            ),
+        }
+
+    pending_rate = round(pending_close * 100 / total)
+    raised_rate = round(raised * 100 / total)
+    insights = [
+        (
+            f"Of the **{total}** total tickets, **{pending_close}** are still pending closure "
+            f",about **{pending_rate}%** of the total needs follow-up."
+        ),
+        (
+            f"**{raised}** of **{total}** tickets ({raised_rate}%) were raised by "
+            f"{data.get('employeeName')}; this suggests most ticket volume was self-raised "
+            f"rather than assigned or inbound, assuming “raised” means initiated by the employee."
+        ),
+        (
+            f"Only **{pending_server}** ticket{' is' if pending_server == 1 else 's are'} pending on server, "
+            f"a {'small' if pending_server < pending_close else 'material'} bottleneck compared with the "
+            f"pending-closure queue."
+        ),
+    ]
+    if data.get("workActivityAvailable"):
+        activity_days = int(data.get("activeWorkDays") or 0)
+        activity_count = int(data.get("workActivityCount") or 0)
+        insights.append(
+            f"Work activity shows **{activity_count}** actions across **{activity_days}** active days."
+        )
+    return {
+        "message": "\n".join(f"- {insight}" for insight in insights),
+    }
+
+
 def is_count_only_query(query: str) -> bool:
     lower = (query or "").lower()
     count_terms = ["how many", "count", "total", "number of"]
@@ -311,6 +355,8 @@ async def dashboard_chat(request: DashboardChatRequest):
         answer_res = format_grouped_summary(tool_data)
     elif kind == "monthly_ticket_count" and isinstance(tool_data, dict):
         answer_res = format_monthly_ticket_count(tool_data)
+    elif kind == "employee_performance" and isinstance(tool_data, dict):
+        answer_res = format_employee_performance(tool_data)
     elif kind == "ticket_list" and isinstance(tool_data, dict) and is_count_only_query(request.message):
         answer_res = format_ticket_count(tool_data, final_result.get("args") or {})
     else:

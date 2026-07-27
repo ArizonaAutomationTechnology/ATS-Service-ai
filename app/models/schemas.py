@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 class PromptRequest(BaseModel):
@@ -40,3 +42,15 @@ class SimilarTicketMatch(BaseModel):
 class SimilarTicketsResponse(BaseModel):
     hasSimilarTickets: bool = Field(..., description="Whether similar tickets were found")
     matches: list[SimilarTicketMatch] = Field(..., description="List of similar ticket matches")
+
+
+class AudioDescriptionResponse(BaseModel):
+    status: str = Field("success", description="success or partial_success")
+    detectedLanguage: str = Field(..., description="Language detected by Faster-Whisper")
+    languageConfidence: float = Field(..., description="Detected-language confidence from 0 to 1")
+    translatedText: str = Field(..., description="English text translated from the recording")
+    polishedDescription: Optional[str] = Field(
+        None,
+        description="Ollama-polished ticket description; null when polishing is unavailable",
+    )
+    warnings: list[str] = Field(default_factory=list, description="Non-blocking processing warnings")

@@ -34,7 +34,7 @@ Planning rules:
 11. If the user asks how many tickets were raised/created in a month, use get_dashboard_counts with metric="monthly_volume" and the dateRangeText so the count matches Monthly Volume Intake. Only use status="Raised" when they ask for tickets currently/now in the Raised state.
 12. If the user asks for a vague "all tickets" query with no date range, status, or narrow filter, ask for a date range.
 13. Use the organization, department, designation, employee, project, CRM, ShareDoc, and Change Tracker tools whenever the question is about those business areas. Do not route them to ticket tools.
-14. The current ASP.NET API has no employee-performance read API. If the user asks for performance, explain that performance data is not available in this chat yet; never guess or calculate it from tickets.
+14. For an employee performance question, use get_employee_performance with the employee name and supplied date range. Ask for either value only when missing.
 15. If a ShareDoc request does not identify one project, ask which project to use. If an entity name is ambiguous, ask the user to choose.
 
 Output schema:
@@ -285,17 +285,45 @@ def _rule_based_analytical_plan(message: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _rule_based_performance_plan(message: str) -> Optional[Dict[str, Any]]:
     lower = message.lower()
-    if "performance" in lower:
+    if "performance" not in lower:
+        return None
+    date_range_text = _detect_date_range_text(lower)
+    if not date_range_text:
         return {
             "needs_clarification": True,
-            "clarification_question": "Employee performance data is not available through the current read-only API yet.",
-            # "suggestions": ["Show employee workload", "Show overdue tickets by employee"],
+            "clarification_question": "Which period should I use for the performance summary?",
             "tool_calls": [],
             "response_format": "clarification",
             "isNextPageRequest": False,
         }
+    user_name = re.sub(r"\b(this year|last year|this month|last month|this week|last week|today|yesterday)\b", " ", lower)
+    user_name = re.sub(r"\b(performance|summary|of|for|employee|report|show|give|me)\b", " ", user_name)
+    user_name = re.sub(r"['’]s\b", "", user_name)
+    user_name = re.sub(r"\s+", " ", user_name).strip()
+    if not user_name:
+        return {
+            "needs_clarification": True,
+            "clarification_question": "Which employee's performance should I summarize?",
+            "tool_calls": [],
+            "response_format": "clarification",
+            "isNextPageRequest": False,
+        }
+    return {
+        "needs_clarification": False,
+        "clarification_question": None,
+        "tool_calls": [{
+            "tool": "get_employee_performance",
+            "args": {"userName": user_name, "dateRangeText": date_range_text},
+        }],
+        "response_format": "employee_performance",
+        "isNextPageRequest": False,
+    }
+
+
+def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    lower = message.lower()
     if "next" in lower and previous_state and previous_state.get("lastTool"):
         return {
             "needs_clarification": False,
@@ -384,8 +412,9 @@ async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any
     if person_status_plan:
         return person_status_plan
 
-    if "performance" in message.lower():
-        return _fallback_plan(message, previous_state)
+    performance_plan = _rule_based_performance_plan(message)
+    if performance_plan:
+        return performance_plan
 
     prompt = planner_prompt.format(
         message=message,

@@ -18,4 +18,4 @@ app/dashboard_chat/chains/__pycache__/
 app/plan.md
 app/services/plan.md
 app/services/nl2sql_service.py
-
+.vs/
