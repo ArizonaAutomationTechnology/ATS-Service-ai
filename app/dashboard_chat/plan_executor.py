@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Any, Dict, List, Tuple
 
-from app.dashboard_chat.tool_registry import TOOL_CATALOG, execute_tool
+from app.dashboard_chat.tool_registry import TOOL_CATALOG, build_langchain_tools
 
 
 ALLOWED_TOOLS = {tool["name"] for tool in TOOL_CATALOG}
@@ -26,8 +26,15 @@ async def execute_plan(
     trace_id: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    last_data: Any = None
     last_executed: Dict[str, Any] = {}
+    tools = {
+        tool.name: tool
+        for tool in build_langchain_tools(
+            user_id=user_id,
+            entity_id=entity_id,
+            block_id=block_id,
+        )
+    }
 
     for raw_call in plan.get("tool_calls") or []:
         tool_name = raw_call.get("tool")
@@ -41,14 +48,7 @@ async def execute_plan(
             continue
 
         started = time.monotonic()
-        result = await execute_tool(
-            tool_name,
-            args,
-            user_id=user_id,
-            entity_id=entity_id,
-            block_id=block_id,
-            previous_result=last_data,
-        )
+        result = await tools[tool_name].ainvoke(args)
         duration_ms = round((time.monotonic() - started) * 1000)
         if result.get("type") == "tool_result" and isinstance(result.get("data"), dict):
             result["data"].setdefault("sourceTimestamp", datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -63,7 +63,6 @@ async def execute_plan(
         results.append(result)
 
         if result.get("type") == "tool_result":
-            last_data = result
             last_executed = {
                 "lastTool": tool_name,
                 "lastArgs": result.get("args") or args,

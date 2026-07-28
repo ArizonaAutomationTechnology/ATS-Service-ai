@@ -11,6 +11,8 @@ class Settings:
     )
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma4:cloud")
+    OLLAMA_API_KEY: str = os.getenv("OLLAMA_API_KEY", "")
+    OLLAMA_TIMEOUT_SECONDS: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
     PORT: int = int(os.getenv("PORT", "8000"))
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "medium")
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")

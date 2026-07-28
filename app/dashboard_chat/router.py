@@ -1,4 +1,5 @@
 import uuid
+import logging
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status
 
@@ -16,6 +17,7 @@ from app.dashboard_chat.chains.answer_chain import run_answer_chain, run_perform
 from app.dashboard_chat.plan_executor import execute_plan
 
 router = APIRouter(prefix="/api/assistant/admin", tags=["dashboard-chat"])
+logger = logging.getLogger(__name__)
 
 SOURCE_LABELS = {
     "search_tickets": "Ticket Registration",
@@ -306,7 +308,8 @@ async def dashboard_chat(request: DashboardChatRequest):
             block_id=request.blockId,
             trace_id=trace_id,
         )
-    except Exception as e:
+    except Exception:
+        logger.exception("Dashboard chat tool execution failed; trace=%s", trace_id)
         return DashboardChatResponse(
             conversationId=conversation_id,
             type="answer",

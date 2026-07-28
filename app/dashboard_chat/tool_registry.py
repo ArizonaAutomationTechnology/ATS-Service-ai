@@ -3,6 +3,9 @@ import calendar
 import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from langchain_core.tools import StructuredTool
+from pydantic import ConfigDict, create_model
+
 from app.config import settings
 from app.dashboard_chat.services.date_parser import parse_date_range
 from app.dashboard_chat.tools.dashboard_tools import get_dashboard_counts, get_priority_counts, get_ticket_count_month_wise
@@ -23,6 +26,14 @@ from app.dashboard_chat.tools.organization_tools import (
 
 ToolHandler = Callable[..., Awaitable[Any]]
 
+EMPLOYEE_TOOL_NAMES = {
+    "search_tickets",
+    "get_ticket_history",
+    "get_dashboard_counts",
+    "get_employee_performance",
+    "group_tickets",
+}
+
 
 TOOL_CATALOG: List[Dict[str, Any]] = [
     {
@@ -42,7 +53,7 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
     {
         "name": "get_dashboard_counts",
         "description": "Fetch dashboard status totals such as all, raised, in-process, completed, closed, reopened, overdue, and rejected ticket counts.",
-        "args": [],
+        "args": ["metric", "dateRangeText", "startDate", "endDate"],
         "returns": "counts",
     },
     {
@@ -154,6 +165,13 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
 
 def get_tool_catalog_for_prompt() -> str:
     return json.dumps(TOOL_CATALOG, indent=2)
+
+
+def get_employee_tool_catalog() -> str:
+    return json.dumps(
+        [tool for tool in TOOL_CATALOG if tool["name"] in EMPLOYEE_TOOL_NAMES],
+        indent=2,
+    )
 
 
 def _norm(value: Optional[str]) -> str:
@@ -390,13 +408,23 @@ async def execute_tool(
     entity_id: str,
     block_id: str,
     previous_result: Any = None,
+    employee_scope: bool = False,
 ) -> Dict[str, Any]:
     args = dict(args or {})
+    if employee_scope and tool_name not in EMPLOYEE_TOOL_NAMES:
+        return {
+            "type": "error",
+            "message": f"The requested tool is not available in employee scope: {tool_name}.",
+        }
     page_size = min(int(args.get("pageSize") or settings.DASHBOARD_CHAT_MAX_PAGE_SIZE), settings.DASHBOARD_CHAT_MAX_PAGE_SIZE)
     page_index = max(1, int(args.get("pageIndex") or 1))
 
     if tool_name == "search_tickets":
-        args = await resolve_lookup_ids(entity_id, block_id, args)
+        if employee_scope:
+            args.pop("userName", None)
+            args["assignedTo"] = user_id
+        else:
+            args = await resolve_lookup_ids(entity_id, block_id, args)
         start_date = args.get("startDate")
         end_date = args.get("endDate")
         date_range_text = args.get("dateRangeText")
@@ -436,6 +464,27 @@ async def execute_tool(
 
     if tool_name == "get_ticket_history":
         ticket_id = args.get("ticketId")
+        if employee_scope and args.get("ticketNo"):
+            lookup = await get_tickets(
+                entity_id=entity_id,
+                block_id=block_id,
+                user_id=user_id,
+                assigned_to=user_id,
+                ticket_no=args["ticketNo"],
+                page_index=1,
+                page_size=1,
+            )
+            tickets = lookup.get("tickets") or []
+            ticket_id = tickets[0].get("ticketId") if tickets else None
+        elif employee_scope and ticket_id:
+            previous_data = previous_result.get("data", previous_result) if isinstance(previous_result, dict) else {}
+            allowed_ids = {
+                ticket.get("ticketId")
+                for ticket in (previous_data.get("tickets") or [])
+                if ticket.get("ticketId")
+            }
+            if ticket_id not in allowed_ids:
+                ticket_id = None
         if not ticket_id:
             return {
                 "type": "clarification",
@@ -505,13 +554,20 @@ async def execute_tool(
 
     if tool_name == "get_employee_performance":
         user_name = str(args.get("userName") or "").strip()
-        if not user_name:
+        if not user_name and not employee_scope:
             return {
                 "type": "clarification",
                 "message": "Which employee's performance should I summarize?",
             }
         users = await get_active_users(entity_id, block_id)
-        matches = [user for user in users if _contains_name(user, user_name, ["name", "userName", "empId"])]
+        matches = (
+            [
+                user for user in users
+                if str(user.get("id") or user.get("userId")) == str(user_id)
+            ]
+            if employee_scope
+            else [user for user in users if _contains_name(user, user_name, ["name", "userName", "empId"])]
+        )
         if len(matches) != 1:
             return {
                 "type": "clarification",
@@ -666,3 +722,62 @@ async def execute_tool(
         "message": f"Unsupported tool: {tool_name}",
         # "suggestions": ["Show overdue tickets", "Project health", "User workload"],
     }
+
+
+def build_langchain_tools(
+    *,
+    user_id: str,
+    entity_id: str,
+    block_id: str,
+    employee_scope: bool = False,
+) -> List[StructuredTool]:
+    """Wrap the scoped ASP.NET operations as LangChain tools for one request."""
+    runtime: Dict[str, Any] = {"previous_result": None}
+    integer_args = {"pageIndex", "pageSize"}
+    tools: List[StructuredTool] = []
+
+    def make_handler(tool_name: str):
+        async def handler(**kwargs: Any) -> Dict[str, Any]:
+            args = {key: value for key, value in kwargs.items() if value is not None}
+            result = await execute_tool(
+                tool_name,
+                args,
+                user_id=user_id,
+                entity_id=entity_id,
+                block_id=block_id,
+                previous_result=runtime["previous_result"],
+                employee_scope=employee_scope,
+            )
+            if result.get("type") == "tool_result":
+                runtime["previous_result"] = result
+            return result
+
+        return handler
+
+    catalog = (
+        [tool for tool in TOOL_CATALOG if tool["name"] in EMPLOYEE_TOOL_NAMES]
+        if employee_scope
+        else TOOL_CATALOG
+    )
+    for spec in catalog:
+        fields = {
+            arg: ((int | None) if arg in integer_args else (str | None), None)
+            for arg in spec.get("args", [])
+        }
+        args_schema = create_model(
+            f"{spec['name'].title().replace('_', '')}Args",
+            __config__=ConfigDict(extra="forbid"),
+            **fields,
+        )
+        description = spec["description"]
+        if spec.get("guardrails"):
+            description = f"{description} Guardrails: {spec['guardrails']}"
+        tools.append(StructuredTool.from_function(
+            coroutine=make_handler(spec["name"]),
+            name=spec["name"],
+            description=description,
+            args_schema=args_schema,
+            infer_schema=False,
+        ))
+
+    return tools

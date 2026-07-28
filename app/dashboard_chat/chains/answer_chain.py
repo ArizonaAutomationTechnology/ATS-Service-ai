@@ -41,7 +41,8 @@ Rules:
 4. When interpreting raisedTickets, state that it is an assumption (for example, \"assuming raised means initiated by the employee\").
 5. If workActivityAvailable is false, do not infer work activity, actions, or active days.
 6. Never include database IDs, employee IDs, internal identifiers, or data not in the payload.
-7. Use positive tone to represent the data.
+7. Provide analytics of the employee performance with some quantitive factors like percentage.
+8. Use positive tone to represent the data.
 
 
 
