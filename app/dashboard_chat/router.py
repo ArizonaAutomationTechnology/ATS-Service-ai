@@ -12,7 +12,7 @@ from app.dashboard_chat.memory import state_store
 from app.dashboard_chat.tools.project_tools import get_active_projects, get_active_categories
 from app.dashboard_chat.tools.user_tools import get_active_users
 from app.dashboard_chat.chains.planner_chain import run_planner_chain
-from app.dashboard_chat.chains.answer_chain import run_answer_chain
+from app.dashboard_chat.chains.answer_chain import run_answer_chain, run_performance_summary_chain
 from app.dashboard_chat.plan_executor import execute_plan
 
 router = APIRouter(prefix="/api/assistant/admin", tags=["dashboard-chat"])
@@ -135,12 +135,12 @@ def format_employee_performance(data: Dict[str, Any]) -> Dict[str, Any]:
     insights = [
         (
             f"Of the **{total}** total tickets, **{pending_close}** are still pending closure "
-            f",about **{pending_rate}%** of the total needs follow-up."
+            f"-- about **{pending_rate}%** of the total needs follow-up."
         ),
         (
             f"**{raised}** of **{total}** tickets ({raised_rate}%) were raised by "
             f"{data.get('employeeName')}; this suggests most ticket volume was self-raised "
-            f"rather than assigned or inbound, assuming “raised” means initiated by the employee."
+            f"rather than assigned or inbound, assuming \"raised\" means initiated by the employee."
         ),
         (
             f"Only **{pending_server}** ticket{' is' if pending_server == 1 else 's are'} pending on server, "
@@ -356,7 +356,9 @@ async def dashboard_chat(request: DashboardChatRequest):
     elif kind == "monthly_ticket_count" and isinstance(tool_data, dict):
         answer_res = format_monthly_ticket_count(tool_data)
     elif kind == "employee_performance" and isinstance(tool_data, dict):
-        answer_res = format_employee_performance(tool_data)
+        answer_res = await run_performance_summary_chain(tool_data)
+        if not answer_res.get("message"):
+            answer_res = format_employee_performance(tool_data)
     elif kind == "ticket_list" and isinstance(tool_data, dict) and is_count_only_query(request.message):
         answer_res = format_ticket_count(tool_data, final_result.get("args") or {})
     else:

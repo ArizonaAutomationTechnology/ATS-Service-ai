@@ -31,6 +31,73 @@ answer_prompt = PromptTemplate(
     template=ANSWER_TEMPLATE
 )
 
+PERFORMANCE_SUMMARY_TEMPLATE = """You are an employee performance analyst for a ticketing system.
+Write a concise insight report from the PERFORMANCE DATA below.
+
+Rules:
+1. Use only the supplied PERFORMANCE DATA. Do not invent counts, dates, causes, trends, or employee facts.
+2. Do not repeat dashboard-card labels such as \"Total Assigned\", \"Active Load\", \"Raised Tickets\", \"Pending To Close\", or \"Pending On Server\" as a list. Explain what the numbers mean instead.
+3. Return 2-4 concise markdown bullet points. Focus on ratios, workload implications, follow-up priorities, and comparisons that can be calculated from the supplied values.
+4. When interpreting raisedTickets, state that it is an assumption (for example, \"assuming raised means initiated by the employee\").
+5. If workActivityAvailable is false, do not infer work activity, actions, or active days.
+6. Never include database IDs, employee IDs, internal identifiers, or data not in the payload.
+7. Use positive tone to represent the data.
+
+
+
+
+Output strictly as JSON with no other text:
+{{
+  \"message\": \"markdown insight report\"
+}}
+
+PERFORMANCE DATA:
+{performance_data}
+"""
+
+performance_summary_prompt = PromptTemplate(
+    input_variables=["performance_data"],
+    template=PERFORMANCE_SUMMARY_TEMPLATE,
+)
+
+
+def _performance_summary_payload(performance_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Pass only display-safe, summary-relevant fields to the LLM."""
+    tickets = performance_data.get("tickets") or {}
+    return {
+        "employeeName": performance_data.get("employeeName"),
+        "designation": performance_data.get("designation"),
+        "startDate": performance_data.get("startDate"),
+        "endDate": performance_data.get("endDate"),
+        "workActivityAvailable": bool(performance_data.get("workActivityAvailable")),
+        "workActivityCount": performance_data.get("workActivityCount"),
+        "activeWorkDays": performance_data.get("activeWorkDays"),
+        "tickets": {
+            "activeTickets": tickets.get("activeTickets", 0),
+            "totalTickets": tickets.get("totalTickets", 0),
+            "raisedTickets": tickets.get("raisedTickets", 0),
+            "pendingToCloseTickets": tickets.get("pendingToCloseTickets", 0),
+            "pendingOnServer": tickets.get("pendingOnServer", 0),
+        },
+    }
+
+
+async def run_performance_summary_chain(performance_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate an LLM insight report; callers retain a deterministic fallback."""
+    prompt = performance_summary_prompt.format(
+        performance_data=json.dumps(_performance_summary_payload(performance_data))
+    )
+    response_text = await call_llm_async(prompt)
+
+    try:
+        result = json.loads(clean_json_response(response_text))
+        message = result.get("message") if isinstance(result, dict) else None
+        if isinstance(message, str) and message.strip():
+            return {"message": message.strip()}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return {}
+
 async def run_answer_chain(query: str, intent: str, filters: Dict[str, Any], api_data: Any) -> Dict[str, Any]:
     prompt = answer_prompt.format(
         query=query,
