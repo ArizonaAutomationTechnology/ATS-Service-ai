@@ -7,7 +7,9 @@ from app.dashboard_chat.schemas import (
     DashboardChatRequest, 
     DashboardChatResponse, 
     ConversationState, 
-    FiltersState
+    FiltersState,
+    TicketDraftState,
+    TicketUpdateDraftState,
 )
 from app.dashboard_chat.memory import state_store
 from app.dashboard_chat.tools.project_tools import get_active_projects, get_active_categories
@@ -20,6 +22,8 @@ router = APIRouter(prefix="/api/assistant/admin", tags=["dashboard-chat"])
 logger = logging.getLogger(__name__)
 
 SOURCE_LABELS = {
+    "modify_ticket": "Ticket Registration",
+    "create_ticket": "Ticket Registration",
     "search_tickets": "Ticket Registration",
     "get_ticket_history": "Ticket Registration",
     "get_dashboard_counts": "Dashboard",
@@ -46,9 +50,117 @@ def response_metadata(tool_results: list[Dict[str, Any]], args: Dict[str, Any]) 
     ))
     filters = {
         key: value for key, value in args.items()
-        if value is not None and key not in {"pageIndex", "pageSize"} and not key.startswith("_")
+        if value is not None
+        and key not in {
+            "pageIndex",
+            "pageSize",
+            "description",
+            "descriptionOldText",
+            "descriptionNewText",
+            "confirm",
+        }
+        and not key.startswith("_")
     }
     return sources, filters
+
+
+TICKET_DRAFT_FIELDS = ("projectName", "categoryName", "priority", "description")
+TICKET_UPDATE_FIELDS = (
+    "ticketNo",
+    "projectName",
+    "categoryName",
+    "priority",
+    "description",
+    "descriptionAction",
+    "descriptionOldText",
+    "descriptionNewText",
+)
+
+
+def is_ticket_creation_cancel(message: str) -> bool:
+    lower = " ".join((message or "").lower().split())
+    return lower in {
+        "cancel",
+        "cancel ticket",
+        "cancel the ticket",
+        "stop",
+        "stop creating ticket",
+        "never mind",
+        "nevermind",
+    }
+
+
+def is_ticket_update_cancel(message: str) -> bool:
+    lower = " ".join((message or "").lower().split())
+    return lower in {
+        "cancel",
+        "cancel update",
+        "cancel modification",
+        "cancel ticket update",
+        "stop",
+        "stop updating ticket",
+        "never mind",
+        "nevermind",
+    }
+
+
+def merge_ticket_draft(state: ConversationState, args: Dict[str, Any]) -> Dict[str, Any]:
+    draft = state.ticketDraft or TicketDraftState()
+    for field in TICKET_DRAFT_FIELDS:
+        value = args.get(field)
+        if isinstance(value, str) and value.strip():
+            setattr(draft, field, value.strip())
+    state.ticketDraft = draft
+    return draft.model_dump(exclude_none=True)
+
+
+def merge_ticket_update_draft(state: ConversationState, args: Dict[str, Any]) -> Dict[str, Any]:
+    draft = state.ticketUpdateDraft or TicketUpdateDraftState()
+    description_action = args.get("descriptionAction")
+    if description_action == "replace_text":
+        draft.description = None
+    elif description_action == "replace_all":
+        draft.descriptionOldText = None
+        draft.descriptionNewText = None
+    for field in TICKET_UPDATE_FIELDS:
+        value = args.get(field)
+        if isinstance(value, str) and value.strip():
+            setattr(draft, field, value.strip())
+    state.ticketUpdateDraft = draft
+    return {
+        **draft.model_dump(exclude_none=True),
+        "confirm": args.get("confirm") is True,
+    }
+
+
+def format_ticket_created(data: Dict[str, Any]) -> Dict[str, str]:
+    ticket_id = data.get("ticketId")
+    ticket_no = data.get("ticketNo")
+    identifiers = []
+    if ticket_id:
+        identifiers.append(f"Ticket ID: **{ticket_id}**")
+    if ticket_no:
+        identifiers.append(f"Ticket Number: **{ticket_no}**")
+    identifier_text = "\n" + "\n".join(f"- {item}" for item in identifiers) if identifiers else ""
+    return {
+        "message": (
+            f"Ticket was raised successfully for "
+            f"**{data.get('projectName')}** in **{data.get('categoryName')}** "
+            f"with **{data.get('priority')}** priority."
+            f"{identifier_text}"
+        )
+    }
+
+
+def format_ticket_updated(data: Dict[str, Any]) -> Dict[str, str]:
+    fields = ", ".join(data.get("changedFields") or [])
+    return {
+        "message": (
+            "Ticket was updated successfully.\n"
+            f"- Ticket Number: **{data.get('ticketNo')}**\n"
+            f"- Modified fields: **{fields}**"
+        )
+    }
 
 
 def conversation_recap(message: str, state: ConversationState) -> Optional[str]:
@@ -252,6 +364,34 @@ async def dashboard_chat(request: DashboardChatRequest):
     elif (state.userId, state.entityId, state.blockId) != (request.userId, request.entityId, request.blockId):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Conversation does not belong to this user scope.")
 
+    if state.ticketUpdateDraft and is_ticket_update_cancel(request.message):
+        message = "Ticket modification cancelled."
+        state.ticketUpdateDraft = None
+        state_store.add_turn(state, "user", request.message)
+        state_store.add_turn(state, "assistant", message)
+        state_store.set(conversation_id, state)
+        return DashboardChatResponse(
+            conversationId=conversation_id,
+            traceId=trace_id,
+            type="answer",
+            message=message,
+            sources=["Conversation"],
+        )
+
+    if state.ticketDraft and is_ticket_creation_cancel(request.message):
+        message = "Ticket creation cancelled."
+        state.ticketDraft = None
+        state_store.add_turn(state, "user", request.message)
+        state_store.add_turn(state, "assistant", message)
+        state_store.set(conversation_id, state)
+        return DashboardChatResponse(
+            conversationId=conversation_id,
+            traceId=trace_id,
+            type="answer",
+            message=message,
+            sources=["Conversation"],
+        )
+
     recap = conversation_recap(request.message, state)
     if recap is not None:
         state_store.add_turn(state, "user", request.message)
@@ -276,10 +416,34 @@ async def dashboard_chat(request: DashboardChatRequest):
         "pageIndex": state.pageIndex,
         "summary": state.summary,
         "recentTurns": [turn.model_dump() for turn in state.recentTurns[-10:]],
+        "ticketDraft": state.ticketDraft.model_dump(exclude_none=True) if state.ticketDraft else None,
+        "ticketUpdateDraft": (
+            state.ticketUpdateDraft.model_dump(exclude_none=True)
+            if state.ticketUpdateDraft
+            else None
+        ),
     }
 
     # 3. Ask the LLM for a dynamic tool plan instead of a fixed intent.
     plan = await run_planner_chain(request.message, prev_state_dict)
+
+    update_call = next(
+        (call for call in (plan.get("tool_calls") or []) if call.get("tool") == "modify_ticket"),
+        None,
+    )
+    if update_call is not None:
+        update_call["args"] = merge_ticket_update_draft(state, update_call.get("args") or {})
+        state.ticketDraft = None
+        state_store.set(conversation_id, state)
+
+    creation_call = next(
+        (call for call in (plan.get("tool_calls") or []) if call.get("tool") == "create_ticket"),
+        None,
+    )
+    if creation_call is not None:
+        creation_call["args"] = merge_ticket_draft(state, creation_call.get("args") or {})
+        state.ticketUpdateDraft = None
+        state_store.set(conversation_id, state)
 
     if plan.get("needs_clarification"):
         state_store.add_turn(state, "user", request.message)
@@ -310,10 +474,15 @@ async def dashboard_chat(request: DashboardChatRequest):
         )
     except Exception:
         logger.exception("Dashboard chat tool execution failed; trace=%s", trace_id)
+        failure_message = "I could not complete that request right now. Please try again."
+        state_store.add_turn(state, "user", request.message)
+        state_store.add_turn(state, "assistant", failure_message)
+        state_store.set(conversation_id, state)
         return DashboardChatResponse(
             conversationId=conversation_id,
+            traceId=trace_id,
             type="answer",
-            message="I could not fetch the requested data right now. Please try again.",
+            message=failure_message,
             # suggestions=["Retry"]
         )
 
@@ -342,10 +511,15 @@ async def dashboard_chat(request: DashboardChatRequest):
 
     failed_result = next((result for result in reversed(tool_results) if result.get("type") == "error"), None)
     if failed_result:
+        failure_message = failed_result.get("message", "I could not complete that request.")
+        state_store.add_turn(state, "user", request.message)
+        state_store.add_turn(state, "assistant", failure_message)
+        state_store.set(conversation_id, state)
         return DashboardChatResponse(
             conversationId=conversation_id,
+            traceId=trace_id,
             type="answer",
-            message=failed_result.get("message", "I could not complete that request."),
+            message=failure_message,
             # suggestions=failed_result.get("suggestions") or ["Try again"],
         )
 
@@ -356,6 +530,10 @@ async def dashboard_chat(request: DashboardChatRequest):
     # 4. Summarize the executed tool data. Grouped counts are deterministic to avoid LLM count drift.
     if kind == "grouped_ticket_summary" and isinstance(tool_data, dict):
         answer_res = format_grouped_summary(tool_data)
+    elif kind == "ticket_updated" and isinstance(tool_data, dict):
+        answer_res = format_ticket_updated(tool_data)
+    elif kind == "ticket_created" and isinstance(tool_data, dict):
+        answer_res = format_ticket_created(tool_data)
     elif kind == "monthly_ticket_count" and isinstance(tool_data, dict):
         answer_res = format_monthly_ticket_count(tool_data)
     elif kind == "employee_performance" and isinstance(tool_data, dict):
@@ -381,6 +559,14 @@ async def dashboard_chat(request: DashboardChatRequest):
     state.lastTool = executed_state.get("lastTool")
     state.lastArgs = executed_state.get("lastArgs") or {}
     state.lastResponseFormat = plan.get("response_format") or kind
+    if kind == "ticket_created":
+        state.ticketDraft = None
+        state.lastTool = None
+        state.lastArgs = {}
+    elif kind == "ticket_updated":
+        state.ticketUpdateDraft = None
+        state.lastTool = None
+        state.lastArgs = {}
     state.pageIndex = int(state.lastArgs.get("pageIndex") or state.pageIndex or 1)
     state_store.add_turn(state, "user", request.message)
     state_store.add_turn(state, "assistant", answer_res.get("message", "Here are the results."))

@@ -56,6 +56,23 @@ class ConversationTurn(BaseModel):
     role: str
     text: str
 
+class TicketDraftState(BaseModel):
+    projectName: Optional[str] = None
+    categoryName: Optional[str] = None
+    priority: Optional[str] = None
+    description: Optional[str] = None
+
+class TicketUpdateDraftState(BaseModel):
+    ticketId: Optional[str] = None
+    ticketNo: Optional[str] = None
+    projectName: Optional[str] = None
+    categoryName: Optional[str] = None
+    priority: Optional[str] = None
+    description: Optional[str] = None
+    descriptionAction: Optional[str] = None
+    descriptionOldText: Optional[str] = None
+    descriptionNewText: Optional[str] = None
+
 class ConversationState(BaseModel):
     conversationId: str
     userId: str
@@ -71,3 +88,5 @@ class ConversationState(BaseModel):
     lastResponseFormat: Optional[str] = None
     summary: str = ""
     recentTurns: List[ConversationTurn] = Field(default_factory=list)
+    ticketDraft: Optional[TicketDraftState] = None
+    ticketUpdateDraft: Optional[TicketUpdateDraftState] = None

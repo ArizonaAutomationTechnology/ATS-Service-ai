@@ -10,7 +10,9 @@ from app.config import settings
 from app.dashboard_chat.services.date_parser import parse_date_range
 from app.dashboard_chat.tools.dashboard_tools import get_dashboard_counts, get_priority_counts, get_ticket_count_month_wise
 from app.dashboard_chat.tools.project_tools import get_active_categories, get_active_projects, get_project_ticket_counts
+from app.dashboard_chat.tools.ticket_creation_tools import create_ticket
 from app.dashboard_chat.tools.ticket_tools import get_ticket_history, get_tickets
+from app.dashboard_chat.tools.ticket_update_tools import modify_ticket
 from app.dashboard_chat.tools.user_tools import get_active_users, get_employee_performance, get_user_workloads
 from app.dashboard_chat.tools.organization_tools import (
     get_changes,
@@ -36,6 +38,31 @@ EMPLOYEE_TOOL_NAMES = {
 
 
 TOOL_CATALOG: List[Dict[str, Any]] = [
+    {
+        "name": "modify_ticket",
+        "description": "Modify an existing ticket's project, category, priority, or complete/targeted description text after resolving the ticket and confirming the changes.",
+        "args": [
+            "ticketId",
+            "ticketNo",
+            "projectName",
+            "categoryName",
+            "priority",
+            "description",
+            "descriptionAction",
+            "descriptionOldText",
+            "descriptionNewText",
+            "confirm",
+        ],
+        "returns": "ticket_updated",
+        "guardrails": "Requires a ticket ID or number, at least one changed field, current-scope validation, and explicit user confirmation before the update API is called.",
+    },
+    {
+        "name": "create_ticket",
+        "description": "Raise a new ticket on behalf of the current user after collecting project, category, priority, and description.",
+        "args": ["projectName", "categoryName", "priority", "description"],
+        "returns": "ticket_created",
+        "guardrails": "Call only for an explicit ticket-creation request or an active ticket draft. The tool asks for every missing field and submits only when all fields are valid.",
+    },
     {
         "name": "search_tickets",
         "description": "Find paginated tickets by status, date range, project, category, user, priority, ticket number, or keyword.",
@@ -419,6 +446,22 @@ async def execute_tool(
     page_size = min(int(args.get("pageSize") or settings.DASHBOARD_CHAT_MAX_PAGE_SIZE), settings.DASHBOARD_CHAT_MAX_PAGE_SIZE)
     page_index = max(1, int(args.get("pageIndex") or 1))
 
+    if tool_name == "modify_ticket":
+        return await modify_ticket(
+            args,
+            user_id=user_id,
+            entity_id=entity_id,
+            block_id=block_id,
+        )
+
+    if tool_name == "create_ticket":
+        return await create_ticket(
+            args,
+            user_id=user_id,
+            entity_id=entity_id,
+            block_id=block_id,
+        )
+
     if tool_name == "search_tickets":
         if employee_scope:
             args.pop("userName", None)
@@ -734,6 +777,7 @@ def build_langchain_tools(
     """Wrap the scoped ASP.NET operations as LangChain tools for one request."""
     runtime: Dict[str, Any] = {"previous_result": None}
     integer_args = {"pageIndex", "pageSize"}
+    boolean_args = {"confirm"}
     tools: List[StructuredTool] = []
 
     def make_handler(tool_name: str):
@@ -761,7 +805,14 @@ def build_langchain_tools(
     )
     for spec in catalog:
         fields = {
-            arg: ((int | None) if arg in integer_args else (str | None), None)
+            arg: (
+                (int | None)
+                if arg in integer_args
+                else (bool | None)
+                if arg in boolean_args
+                else (str | None),
+                None,
+            )
             for arg in spec.get("args", [])
         }
         args_schema = create_model(

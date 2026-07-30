@@ -61,6 +61,220 @@ planner_prompt = PromptTemplate(
     template=PLANNER_TEMPLATE,
 )
 
+TICKET_DRAFT_TEMPLATE = """You extract required fields for creating one ticket.
+
+Existing ticket draft:
+{ticket_draft}
+
+Recent conversation:
+{recent_turns}
+
+Current user message:
+{message}
+
+Return strictly valid JSON with only these keys:
+{{
+  "projectName": string or null,
+  "categoryName": string or null,
+  "priority": "High", "Medium", "Low", or null,
+  "description": string or null
+}}
+
+Rules:
+1. Preserve an existing value unless the current user explicitly replaces it.
+2. Extract only information the user supplied. Never invent a value.
+3. "Raise/create/open/log/submit a ticket" alone provides no ticket field.
+4. A short unlabeled reply may fill the field requested in the recent conversation.
+5. Do not include CreatedBy, user IDs, entity IDs, block IDs, status, or any other field.
+"""
+
+ticket_draft_prompt = PromptTemplate(
+    input_variables=["message", "ticket_draft", "recent_turns"],
+    template=TICKET_DRAFT_TEMPLATE,
+)
+
+TICKET_DRAFT_FIELDS = ("projectName", "categoryName", "priority", "description")
+TICKET_UPDATE_FIELDS = (
+    "ticketId",
+    "ticketNo",
+    "projectName",
+    "categoryName",
+    "priority",
+    "description",
+    "descriptionAction",
+    "descriptionOldText",
+    "descriptionNewText",
+)
+TICKET_NUMBER_PATTERN = re.compile(r"\bATS-?\d+\b", re.IGNORECASE)
+
+TICKET_UPDATE_TEMPLATE = """You extract fields for modifying one existing ticket.
+
+Existing modification draft:
+{ticket_update_draft}
+
+Recent conversation:
+{recent_turns}
+
+Current user message:
+{message}
+
+Return strictly valid JSON with only these keys:
+{{
+  "ticketId": string or null,
+  "ticketNo": string or null,
+  "projectName": string or null,
+  "categoryName": string or null,
+  "priority": "High", "Medium", "Low", or null,
+  "description": string or null,
+  "descriptionAction": "replace_all", "replace_text", or null,
+  "descriptionOldText": string or null,
+  "descriptionNewText": string or null,
+  "confirm": true or false
+}}
+
+Rules:
+1. Preserve existing draft values unless the current user explicitly replaces them.
+2. Extract only values supplied by the user. Never invent a value.
+3. The user may modify only project, category, priority, or description.
+4. Set confirm=true only when the current message explicitly confirms the displayed update.
+5. If the current message changes any value, set confirm=false so the revised change is shown again.
+6. Do not include user IDs, entity IDs, block IDs, client IDs, status, assignment, dates, or audit fields.
+7. A trailing phrase such as "of ticket ATS290726001" identifies the ticket and is not part of the description.
+8. For "update description to testing of ticket ATS290726001", extract ticketNo="ATS290726001" and description="testing".
+9. Use descriptionAction="replace_text" for targeted edits such as "instead of", "replace X with Y", or "change X to Y". Put the literal text to find in descriptionOldText, the replacement in descriptionNewText, and leave description null.
+10. For "make it throw in Mustaba's mouth instead of dustbin", extract descriptionAction="replace_text", descriptionOldText="dustbin", and descriptionNewText="Mustaba's mouth".
+11. Use descriptionAction="replace_all" only when the user explicitly sets or replaces the complete description. Put the complete new value in description and leave descriptionOldText and descriptionNewText null.
+"""
+
+ticket_update_prompt = PromptTemplate(
+    input_variables=["message", "ticket_update_draft", "recent_turns"],
+    template=TICKET_UPDATE_TEMPLATE,
+)
+
+
+def is_ticket_creation_request(message: str) -> bool:
+    lower = " ".join((message or "").lower().split())
+    patterns = [
+        r"\b(raise|create|log|submit|register)\s+(?:a|an|new|another)?\s*ticket\b",
+        r"\bopen\s+(?:a|an|new|another)\s+ticket\b",
+    ]
+    return any(re.search(pattern, lower) for pattern in patterns)
+
+
+def is_ticket_update_request(message: str) -> bool:
+    lower = " ".join((message or "").lower().split())
+    return bool(re.search(r"\b(modify|update|edit|change)\b.*\bticket\b", lower))
+
+
+def _strip_ticket_locator(description: str, ticket_no: str) -> str:
+    if not description or not ticket_no:
+        return description
+    locator = re.compile(
+        rf"\s+(?:(?:of|for|on|in)\s+)?(?:the\s+)?ticket"
+        rf"(?:\s+(?:number|no\.?))?\s*[:#-]?\s*{re.escape(ticket_no)}"
+        r"\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    )
+    return locator.sub("", description).strip()
+
+
+async def _run_ticket_creation_plan(
+    message: str,
+    previous_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    existing = {
+        key: value
+        for key, value in (previous_state.get("ticketDraft") or {}).items()
+        if key in TICKET_DRAFT_FIELDS and isinstance(value, str) and value.strip()
+    }
+    prompt = ticket_draft_prompt.format(
+        message=message,
+        ticket_draft=json.dumps(existing),
+        recent_turns=json.dumps(previous_state.get("recentTurns") or []),
+    )
+    response_text = await call_llm_async(prompt)
+    try:
+        extracted = json.loads(clean_json_response(response_text))
+        if not isinstance(extracted, dict):
+            extracted = {}
+    except Exception:
+        extracted = {}
+
+    merged = dict(existing)
+    for field in TICKET_DRAFT_FIELDS:
+        value = extracted.get(field)
+        if isinstance(value, str) and value.strip():
+            merged[field] = value.strip()
+
+    return {
+        "needs_clarification": False,
+        "clarification_question": None,
+        "tool_calls": [{"tool": "create_ticket", "args": merged}],
+        "response_format": "ticket_created",
+        "isNextPageRequest": False,
+    }
+
+
+async def _run_ticket_update_plan(
+    message: str,
+    previous_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    existing = {
+        key: value
+        for key, value in (previous_state.get("ticketUpdateDraft") or {}).items()
+        if key in TICKET_UPDATE_FIELDS and isinstance(value, str) and value.strip()
+    }
+    prompt = ticket_update_prompt.format(
+        message=message,
+        ticket_update_draft=json.dumps(existing),
+        recent_turns=json.dumps(previous_state.get("recentTurns") or []),
+    )
+    response_text = await call_llm_async(prompt)
+    try:
+        extracted = json.loads(clean_json_response(response_text))
+        if not isinstance(extracted, dict):
+            extracted = {}
+    except Exception:
+        extracted = {}
+
+    message_ticket_no = TICKET_NUMBER_PATTERN.search(message or "")
+    if message_ticket_no:
+        extracted["ticketNo"] = message_ticket_no.group(0).upper()
+
+    merged = dict(existing)
+    changed = False
+    for field in TICKET_UPDATE_FIELDS:
+        value = extracted.get(field)
+        if isinstance(value, str) and value.strip():
+            value = value.strip()
+            if field in {"description", "descriptionNewText"}:
+                value = _strip_ticket_locator(
+                    value,
+                    extracted.get("ticketNo") or existing.get("ticketNo") or "",
+                )
+                if not value:
+                    continue
+            changed = changed or merged.get(field) != value
+            merged[field] = value
+
+    description_action = merged.get("descriptionAction")
+    if description_action == "replace_text" and merged.pop("description", None):
+        changed = True
+    elif description_action == "replace_all":
+        changed = bool(
+            merged.pop("descriptionOldText", None)
+            or merged.pop("descriptionNewText", None)
+        ) or changed
+
+    confirm = extracted.get("confirm") is True and not changed
+    return {
+        "needs_clarification": False,
+        "clarification_question": None,
+        "tool_calls": [{"tool": "modify_ticket", "args": {**merged, "confirm": confirm}}],
+        "response_format": "ticket_updated",
+        "isNextPageRequest": False,
+    }
+
 
 def _detect_status(lower: str) -> Optional[str]:
     status_patterns = [
@@ -399,6 +613,12 @@ def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Di
 async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if previous_state is None:
         previous_state = {}
+
+    if previous_state.get("ticketUpdateDraft") or is_ticket_update_request(message):
+        return await _run_ticket_update_plan(message, previous_state)
+
+    if previous_state.get("ticketDraft") or is_ticket_creation_request(message):
+        return await _run_ticket_creation_plan(message, previous_state)
 
     raised_count_plan = _rule_based_raised_count_plan(message)
     if raised_count_plan:

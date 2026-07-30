@@ -42,7 +42,8 @@ Rules:
 5. If workActivityAvailable is false, do not infer work activity, actions, or active days.
 6. Never include database IDs, employee IDs, internal identifiers, or data not in the payload.
 7. Provide analytics of the employee performance with some quantitive factors like percentage.
-8. Use positive tone to represent the data.
+8. Give a overall performance score from 10 to the employee.
+9. Use Neural tone to represent the data.
 
 
 
