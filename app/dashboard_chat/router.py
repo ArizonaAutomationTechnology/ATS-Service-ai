@@ -15,11 +15,18 @@ from app.dashboard_chat.memory import state_store
 from app.dashboard_chat.tools.project_tools import get_active_projects, get_active_categories
 from app.dashboard_chat.tools.user_tools import get_active_users
 from app.dashboard_chat.chains.planner_chain import run_planner_chain
-from app.dashboard_chat.chains.answer_chain import run_answer_chain, run_performance_summary_chain
+from app.dashboard_chat.chains.answer_chain import (
+    _performance_analysis,
+    run_answer_chain,
+)
 from app.dashboard_chat.plan_executor import execute_plan
 
 router = APIRouter(prefix="/api/assistant/admin", tags=["dashboard-chat"])
 logger = logging.getLogger(__name__)
+
+
+def _normalized_scope_value(value: str) -> str:
+    return str(value or "").strip().lower()
 
 SOURCE_LABELS = {
     "modify_ticket": "Ticket Registration",
@@ -231,46 +238,97 @@ def format_monthly_ticket_count(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def format_employee_performance(data: Dict[str, Any]) -> Dict[str, Any]:
-    tickets = data.get("tickets") or {}
-    total = int(tickets.get("totalTickets") or 0)
-    raised = int(tickets.get("raisedTickets") or 0)
-    pending_close = int(tickets.get("pendingToCloseTickets") or 0)
-    pending_server = int(tickets.get("pendingOnServer") or 0)
+    analysis = _performance_analysis(data)
+    assigned = analysis["assigned"]
+    created = analysis["created"]
+    comparison = analysis["volumeComparison"]
+    period = data.get("period") or {}
+    assigned_total = assigned["total"]
+    created_total = created["total"]
+    start_date = period.get("startDate")
+    end_date = period.get("endDate")
+    employee_name = data.get("employeeName") or "Employee"
+    period_text = (
+        f"from **{start_date} to {end_date}**"
+        if period.get("appliedToData") is True and start_date and end_date
+        else "in the available data"
+    )
 
-    if not total:
+    def percentage(value: Any) -> str:
+        if value is None:
+            return "unavailable"
+        return f"{float(value):.1f}".rstrip("0").rstrip(".") + "%"
+
+    if not assigned_total and not created_total:
         return {
             "message": (
-                f"I found no ticket activity for **{data.get('employeeName')}** "
-                f"between **{data.get('startDate')} and {data.get('endDate')}**."
+                f"### {employee_name}\n"
+                f"- **Conclusion:** No assigned or created ticket activity was recorded "
+                f"{period_text}, so there is no workload evidence to analyze."
             ),
         }
 
-    pending_rate = round(pending_close * 100 / total)
-    raised_rate = round(raised * 100 / total)
-    insights = [
-        (
-            f"Of the **{total}** total tickets, **{pending_close}** are still pending closure "
-            f"-- about **{pending_rate}%** of the total needs follow-up."
-        ),
-        (
-            f"**{raised}** of **{total}** tickets ({raised_rate}%) were raised by "
-            f"{data.get('employeeName')}; this suggests most ticket volume was self-raised "
-            f"rather than assigned or inbound, assuming \"raised\" means initiated by the employee."
-        ),
-        (
-            f"Only **{pending_server}** ticket{' is' if pending_server == 1 else 's are'} pending on server, "
-            f"a {'small' if pending_server < pending_close else 'material'} bottleneck compared with the "
-            f"pending-closure queue."
-        ),
-    ]
-    if data.get("workActivityAvailable"):
-        activity_days = int(data.get("activeWorkDays") or 0)
-        activity_count = int(data.get("workActivityCount") or 0)
+    insights = []
+    if assigned_total:
+        active_rate = assigned["activeRatePct"] or 0
+        backlog_label = "minimal" if active_rate <= 5 else "limited" if active_rate <= 20 else "material"
         insights.append(
-            f"Work activity shows **{activity_count}** actions across **{activity_days}** active days."
+            f"**Resolution:** {period_text.capitalize()}, **{percentage(assigned['resolutionRatePct'])}** of assigned workload was resolved "
+            f"(**{assigned['resolved']} of {assigned_total}** tickets). The active backlog is "
+            f"**{percentage(assigned['activeRatePct'])}** (**{assigned['active']}** tickets), which is {backlog_label}."
         )
+        if assigned["overdue"]:
+            risk_text = (
+                f"**Risk:** **{percentage(assigned['overdueRatePct'])}** of assigned workload is overdue "
+                f"(**{assigned['overdue']}** tickets), making overdue follow-up the immediate priority."
+            )
+        else:
+            risk_text = "**Risk:** No assigned tickets are overdue, so there is no recorded overdue exposure in this period."
+        if assigned["pendingOnServer"] and assigned["active"]:
+            risk_text += (
+                f" Server-pending work represents **{percentage(assigned['pendingServerShareOfActivePct'])}** "
+                f"of the active backlog (**{assigned['pendingOnServer']} of {assigned['active']}** tickets)."
+            )
+        insights.append(risk_text)
+    else:
+        insights.extend([
+            f"**Resolution:** No assigned tickets were recorded {period_text}.",
+            "**Risk:** With no assigned workload, assigned-ticket backlog and overdue exposure are not applicable.",
+        ])
+
+    relationship = comparison["createdComparedWithAssigned"]
+    difference = comparison["absoluteDifference"]
+    if relationship == "matched":
+        comparison_text = f"created volume matched assigned volume at **{created_total}** tickets each"
+    else:
+        comparison_text = (
+            f"created volume was **{difference}** tickets {relationship} than assigned volume "
+            f"(**{created_total} created vs {assigned_total} assigned**)"
+        )
+    if created_total:
+        insights.append(
+            f"**Volume context:** {comparison_text.capitalize()}, while **{percentage(created['resolutionRatePct'])}** of created tickets "
+            f"were resolved. These populations may overlap, so this comparison does not prove self-assignment."
+        )
+    else:
+        insights.append("**Volume context:** No tickets were created by the employee during the selected period.")
+
+    if assigned_total and assigned["overdue"]:
+        conclusion = "Resolution progress is offset by overdue exposure; overdue tickets should be reviewed first."
+    elif assigned_total and (assigned["activeRatePct"] or 0) <= 5:
+        focus = (
+            "the server-pending item" if assigned["pendingOnServer"] == 1
+            else "server-pending items" if assigned["pendingOnServer"] > 1
+            else "the small remaining active queue"
+        )
+        conclusion = f"The assigned workload is highly resolved with low backlog risk; follow-up can focus on {focus}."
+    elif assigned_total:
+        conclusion = "The workload shows meaningful unresolved volume; reducing the active queue is the clearest follow-up priority."
+    else:
+        conclusion = "Only created-ticket activity is available, so no conclusion can be drawn about assigned workload."
+    insights.append(f"**Conclusion:** {conclusion}")
     return {
-        "message": "\n".join(f"- {insight}" for insight in insights),
+        "message": f"### {employee_name}\n" + "\n".join(f"- {insight}" for insight in insights[:4]),
     }
 
 
@@ -289,6 +347,18 @@ def format_ticket_count(data: Dict[str, Any], args: Dict[str, Any]) -> Dict[str,
         "message": f"I found **{total}** tickets{label}.",
         # "suggestions": ["Show ticket list", "Group by project", "Group by assignee"],
     }
+
+
+def format_ticket_list(data: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+    total = int(data.get("totalCount") or 0)
+    returned = len(data.get("tickets") or [])
+    status_value = args.get("status")
+    label = f" with status **{status_value}**" if status_value else ""
+    if not total:
+        return {"message": f"I found no tickets{label} matching those filters."}
+    page = int(data.get("pageIndex") or 1)
+    showing = f" Showing **{returned}** on page **{page}**." if returned < total else ""
+    return {"message": f"I found **{total}** tickets{label}.{showing}"}
 
 async def resolve_lookup_ids(
     entity_id: str,
@@ -336,8 +406,11 @@ async def resolve_lookup_ids(
 
     return results
 
-@router.post("/dashboard-chat", response_model=DashboardChatResponse)
-async def dashboard_chat(request: DashboardChatRequest):
+async def handle_dashboard_chat(
+    request: DashboardChatRequest,
+    *,
+    employee_scope: bool = False,
+):
     # 1. Reject oversized requests to prevent prompt injection / context overflow
     # DASHBOARD_CHAT_CONTEXT_LIMIT_KB defaults to 40 KB
     content_kb = len(request.message.encode('utf-8')) / 1024.0
@@ -360,9 +433,20 @@ async def dashboard_chat(request: DashboardChatRequest):
             conversationId=conversation_id,
             userId=request.userId,
             entityId=request.entityId,
-            blockId=request.blockId
+            blockId=request.blockId,
+            accessRole="Employee" if employee_scope else "Admin",
         )
-    elif (state.userId, state.entityId, state.blockId) != (request.userId, request.entityId, request.blockId):
+    elif (
+        _normalized_scope_value(state.userId),
+        _normalized_scope_value(state.entityId),
+        _normalized_scope_value(state.blockId),
+        state.accessRole.lower(),
+    ) != (
+        _normalized_scope_value(request.userId),
+        _normalized_scope_value(request.entityId),
+        _normalized_scope_value(request.blockId),
+        "employee" if employee_scope else "admin",
+    ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Conversation does not belong to this user scope.")
 
     if state.ticketUpdateDraft and is_ticket_update_cancel(request.message):
@@ -426,7 +510,11 @@ async def dashboard_chat(request: DashboardChatRequest):
     }
 
     # 3. Ask the LLM for a dynamic tool plan instead of a fixed intent.
-    plan = await run_planner_chain(request.message, prev_state_dict)
+    plan = await run_planner_chain(
+        request.message,
+        prev_state_dict,
+        employee_scope=employee_scope,
+    )
 
     update_call = next(
         (call for call in (plan.get("tool_calls") or []) if call.get("tool") == "modify_ticket"),
@@ -472,6 +560,7 @@ async def dashboard_chat(request: DashboardChatRequest):
             entity_id=request.entityId,
             block_id=request.blockId,
             trace_id=trace_id,
+            employee_scope=employee_scope,
         )
     except Exception:
         logger.exception("Dashboard chat tool execution failed; trace=%s", trace_id)
@@ -512,7 +601,13 @@ async def dashboard_chat(request: DashboardChatRequest):
             # suggestions=["Show overdue tickets", "Project health", "User workload"]
         )
 
-    failed_result = next((result for result in reversed(tool_results) if result.get("type") == "error"), None)
+    failed_result = next(
+        (
+            result for result in reversed(tool_results)
+            if result.get("type") in {"error", "access_denied"}
+        ),
+        None,
+    )
     if failed_result:
         failure_message = failed_result.get("message", "I could not complete that request.")
         state_store.add_turn(state, "user", request.message)
@@ -540,11 +635,13 @@ async def dashboard_chat(request: DashboardChatRequest):
     elif kind == "monthly_ticket_count" and isinstance(tool_data, dict):
         answer_res = format_monthly_ticket_count(tool_data)
     elif kind == "employee_performance" and isinstance(tool_data, dict):
-        answer_res = await run_performance_summary_chain(tool_data)
-        if not answer_res.get("message"):
-            answer_res = format_employee_performance(tool_data)
-    elif kind == "ticket_list" and isinstance(tool_data, dict) and is_count_only_query(request.message):
-        answer_res = format_ticket_count(tool_data, final_result.get("args") or {})
+        answer_res = format_employee_performance(tool_data)
+    elif kind == "ticket_list" and isinstance(tool_data, dict):
+        answer_res = (
+            format_ticket_count(tool_data, final_result.get("args") or {})
+            if is_count_only_query(request.message)
+            else format_ticket_list(tool_data, final_result.get("args") or {})
+        )
     else:
         answer_res = await run_answer_chain(
             query=request.message,
@@ -601,3 +698,13 @@ async def dashboard_chat(request: DashboardChatRequest):
         sources=sources,
         appliedFilters=applied_filters,
     )
+
+
+@router.post("/dashboard-chat", response_model=DashboardChatResponse)
+async def dashboard_chat(request: DashboardChatRequest):
+    if _normalized_scope_value(request.userRole) != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin chatbot access requires an Admin role.",
+        )
+    return await handle_dashboard_chat(request)

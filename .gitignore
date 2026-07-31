@@ -2,9 +2,11 @@ venv/
 .env
 .agents/
 scratch/
+.vscode/
 graphify-out/
 pyrightconfig.json
 airllm/
+tests/
 tests/
 app/__pycache__/
 app/api/__pycache__/

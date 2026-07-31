@@ -78,6 +78,7 @@ class ConversationState(BaseModel):
     userId: str
     entityId: str
     blockId: str
+    accessRole: str = "Admin"
     lastIntent: Optional[str] = None
     filters: FiltersState = Field(default_factory=FiltersState)
     pageIndex: int = 1

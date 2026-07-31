@@ -11,9 +11,14 @@ from app.dashboard_chat.services.date_parser import parse_date_range
 from app.dashboard_chat.tools.dashboard_tools import get_dashboard_counts, get_priority_counts, get_ticket_count_month_wise
 from app.dashboard_chat.tools.project_tools import get_active_categories, get_active_projects, get_project_ticket_counts
 from app.dashboard_chat.tools.ticket_creation_tools import create_ticket
-from app.dashboard_chat.tools.ticket_tools import get_ticket_history, get_tickets
+from app.dashboard_chat.tools.ticket_tools import get_ticket_history, get_ticket_record, get_tickets
 from app.dashboard_chat.tools.ticket_update_tools import modify_ticket
-from app.dashboard_chat.tools.user_tools import get_active_users, get_employee_performance, get_user_workloads
+from app.dashboard_chat.tools.user_tools import (
+    get_active_users,
+    get_scoped_employee_performance,
+    get_user_ticket_counts,
+    get_user_workloads,
+)
 from app.dashboard_chat.tools.organization_tools import (
     get_changes,
     get_clients,
@@ -29,13 +34,14 @@ from app.dashboard_chat.tools.organization_tools import (
 ToolHandler = Callable[..., Awaitable[Any]]
 
 EMPLOYEE_TOOL_NAMES = {
+    "modify_ticket",
+    "create_ticket",
     "search_tickets",
     "get_ticket_history",
     "get_dashboard_counts",
     "get_employee_performance",
     "group_tickets",
 }
-
 
 TOOL_CATALOG: List[Dict[str, Any]] = [
     {
@@ -103,10 +109,10 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "name": "get_employee_performance",
-        "description": "Summarize one employee's work activity and dashboard ticket metrics for a supplied date range.",
+        "description": "Summarize one employee's date-filtered assigned and created ticket workload for a supplied date range.",
         "args": ["userName", "dateRangeText"],
         "returns": "employee_performance",
-        "guardrails": "Requires one employee and a date range. For 'this year', query from 1 January through today.",
+        "guardrails": "Requires one employee and a date range. Keep assigned and created ticket metrics separate; do not infer a performance score.",
     },
     {
         "name": "get_active_projects",
@@ -203,6 +209,40 @@ def get_employee_tool_catalog() -> str:
 
 def _norm(value: Optional[str]) -> str:
     return (value or "").lower().replace("project", "").strip()
+
+
+def _same_id(left: Any, right: Any) -> bool:
+    return str(left or "").strip().lower() == str(right or "").strip().lower()
+
+
+def _employee_for_user(users: List[Dict[str, Any]], user_id: str) -> Optional[Dict[str, Any]]:
+    return next(
+        (
+            user for user in users
+            if _same_id(user.get("id") or user.get("Id") or user.get("userId"), user_id)
+            and str(user.get("groupName") or user.get("GroupName") or "").strip().lower() == "employee"
+        ),
+        None,
+    )
+
+
+def _employee_access_denied() -> Dict[str, Any]:
+    return {
+        "type": "access_denied",
+        "message": "I can only provide information for your own employee account.",
+    }
+
+
+def _ticket_access_denied() -> Dict[str, Any]:
+    return {
+        "type": "access_denied",
+        "message": "I can only provide information about tickets related to your account.",
+    }
+
+
+def _row_value(row: Dict[str, Any], *names: str) -> Any:
+    lowered = {str(key).lower(): value for key, value in row.items()}
+    return next((lowered[name.lower()] for name in names if name.lower() in lowered), None)
 
 
 def _contains_name(candidate: Dict[str, Any], query: Optional[str], keys: List[str]) -> bool:
@@ -396,6 +436,7 @@ async def _fetch_complete_ticket_rows_for_grouping(
     block_id: str,
     user_id: str,
     source_result: Dict[str, Any],
+    employee_scope: bool = False,
 ) -> Dict[str, Any]:
     source_data = source_result.get("data") or {}
     query_args = source_result.get("args") or {}
@@ -413,6 +454,7 @@ async def _fetch_complete_ticket_rows_for_grouping(
         keyword=query_args.get("keyword"),
         ticket_no=query_args.get("ticketNo"),
         for_report=True,
+        employee_scope=employee_scope,
     )
     tickets = complete_result.get("tickets") or []
     total_count = int(complete_result.get("totalCount") or len(tickets))
@@ -439,11 +481,10 @@ async def execute_tool(
 ) -> Dict[str, Any]:
     args = dict(args or {})
     if employee_scope and tool_name not in EMPLOYEE_TOOL_NAMES:
-        return {
-            "type": "error",
-            "message": f"The requested tool is not available in employee scope: {tool_name}.",
-        }
+        return _employee_access_denied()
     page_size = min(int(args.get("pageSize") or settings.DASHBOARD_CHAT_MAX_PAGE_SIZE), settings.DASHBOARD_CHAT_MAX_PAGE_SIZE)
+    if employee_scope:
+        page_size = min(page_size, 12)
     page_index = max(1, int(args.get("pageIndex") or 1))
 
     if tool_name == "modify_ticket":
@@ -464,7 +505,21 @@ async def execute_tool(
 
     if tool_name == "search_tickets":
         if employee_scope:
+            requested_user = str(args.get("userName") or "").strip()
+            if requested_user and requested_user.lower() not in {"me", "my", "mine", "myself"}:
+                employee = _employee_for_user(
+                    await get_active_users(entity_id, block_id),
+                    user_id,
+                )
+                if not employee or not _contains_name(
+                    employee,
+                    requested_user,
+                    ["name", "Name", "userName", "UserName", "empId", "EmpId"],
+                ):
+                    return _employee_access_denied()
             args.pop("userName", None)
+            args.pop("assignedTo", None)
+            args = await resolve_lookup_ids(entity_id, block_id, args)
             args["assignedTo"] = user_id
         else:
             args = await resolve_lookup_ids(entity_id, block_id, args)
@@ -496,6 +551,7 @@ async def execute_tool(
             ticket_no=args.get("ticketNo"),
             page_index=page_index,
             page_size=page_size,
+            employee_scope=employee_scope,
         )
         return {
             "type": "tool_result",
@@ -512,23 +568,37 @@ async def execute_tool(
                 entity_id=entity_id,
                 block_id=block_id,
                 user_id=user_id,
-                assigned_to=user_id,
                 ticket_no=args["ticketNo"],
                 page_index=1,
-                page_size=1,
+                page_size=12,
+                employee_scope=True,
             )
-            tickets = lookup.get("tickets") or []
-            ticket_id = tickets[0].get("ticketId") if tickets else None
-        elif employee_scope and ticket_id:
-            previous_data = previous_result.get("data", previous_result) if isinstance(previous_result, dict) else {}
-            allowed_ids = {
-                ticket.get("ticketId")
-                for ticket in (previous_data.get("tickets") or [])
-                if ticket.get("ticketId")
-            }
-            if ticket_id not in allowed_ids:
-                ticket_id = None
+            exact_matches = [
+                ticket for ticket in (lookup.get("tickets") or [])
+                if str(ticket.get("ticketNo") or "").strip().lower()
+                == str(args["ticketNo"]).strip().lower()
+            ]
+            ticket_id = exact_matches[0].get("ticketId") if len(exact_matches) == 1 else None
+
+        if employee_scope and ticket_id:
+            ticket = await get_ticket_record(str(ticket_id))
+            in_organization = bool(ticket) and _same_id(
+                _row_value(ticket, "entityId"),
+                entity_id,
+            ) and _same_id(
+                _row_value(ticket, "blockId"),
+                block_id,
+            )
+            related_to_user = bool(ticket) and (
+                _same_id(_row_value(ticket, "createdBy"), user_id)
+                or _same_id(_row_value(ticket, "assignTo"), user_id)
+            )
+            if not (in_organization and related_to_user):
+                return _ticket_access_denied()
+
         if not ticket_id:
+            if employee_scope:
+                return _ticket_access_denied()
             return {
                 "type": "clarification",
                 "message": "Please provide the ticket number or open a specific ticket first.",
@@ -543,6 +613,44 @@ async def execute_tool(
         }
 
     if tool_name == "get_dashboard_counts":
+        if employee_scope:
+            if args.get("metric") == "monthly_volume":
+                start_date = args.get("startDate")
+                end_date = args.get("endDate")
+                if args.get("dateRangeText") and not (start_date and end_date):
+                    start_date, end_date = parse_date_range(args["dateRangeText"])
+                tickets = await get_tickets(
+                    entity_id=entity_id,
+                    block_id=block_id,
+                    user_id=user_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    for_report=True,
+                    employee_scope=True,
+                )
+                month, year = _extract_single_month({
+                    **args,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                })
+                return {
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "kind": "monthly_ticket_count",
+                    "args": {**args, "startDate": start_date, "endDate": end_date},
+                    "data": {
+                        "month": month,
+                        "year": year,
+                        "count": tickets.get("totalCount", 0),
+                    },
+                }
+            return {
+                "type": "tool_result",
+                "tool": tool_name,
+                "kind": "counts",
+                "args": args,
+                "data": await get_user_ticket_counts(user_id, entity_id, block_id),
+            }
         if args.get("metric") == "monthly_volume":
             monthly_data = await get_ticket_count_month_wise()
             return {
@@ -603,14 +711,19 @@ async def execute_tool(
                 "message": "Which employee's performance should I summarize?",
             }
         users = await get_active_users(entity_id, block_id)
-        matches = (
-            [
-                user for user in users
-                if str(user.get("id") or user.get("userId")) == str(user_id)
-            ]
-            if employee_scope
-            else [user for user in users if _contains_name(user, user_name, ["name", "userName", "empId"])]
-        )
+        if employee_scope:
+            employee = _employee_for_user(users, user_id)
+            if not employee:
+                return _employee_access_denied()
+            if user_name and user_name.lower() not in {"me", "my", "mine", "myself"} and not _contains_name(
+                employee,
+                user_name,
+                ["name", "Name", "userName", "UserName", "empId", "EmpId"],
+            ):
+                return _employee_access_denied()
+            matches = [employee]
+        else:
+            matches = [user for user in users if _contains_name(user, user_name, ["name", "userName", "empId"])]
         if len(matches) != 1:
             return {
                 "type": "clarification",
@@ -630,14 +743,28 @@ async def execute_tool(
                 "message": "That performance period is in the future. Please choose a period up to today.",
             }
         employee = matches[0]
-        employee_id = employee.get("id") or employee.get("userId")
-        employee_name = employee.get("name") or employee.get("userName") or user_name
+        employee_id = employee.get("id") or employee.get("Id") or employee.get("userId")
+        employee_name = (
+            employee.get("name")
+            or employee.get("Name")
+            or employee.get("userName")
+            or employee.get("UserName")
+            or user_name
+        )
+        performance = await get_scoped_employee_performance(
+            employee=employee,
+            user_id=user_id if employee_scope else employee_id,
+            entity_id=entity_id,
+            block_id=block_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
         return {
             "type": "tool_result",
             "tool": tool_name,
             "kind": "employee_performance",
             "args": {**args, "userName": employee_name, "startDate": start_date, "endDate": end_date},
-            "data": await get_employee_performance(employee_id, employee_name, start_date, end_date),
+            "data": performance,
         }
 
     if tool_name == "get_active_projects":
@@ -676,6 +803,7 @@ async def execute_tool(
                 block_id=block_id,
                 user_id=user_id,
                 source_result=source,
+                employee_scope=employee_scope,
             )
             tickets = source_data.get("tickets")
             total_count = source_data.get("totalCount", len(tickets or []))

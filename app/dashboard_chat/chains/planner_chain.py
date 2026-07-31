@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 from langchain_core.prompts import PromptTemplate
 
 from app.dashboard_chat.chains.intent_chain import clean_json_response
-from app.dashboard_chat.tool_registry import get_tool_catalog_for_prompt
+from app.dashboard_chat.tool_registry import get_employee_tool_catalog, get_tool_catalog_for_prompt
 from app.services.llm_service import call_llm_async
 
 
@@ -16,6 +16,9 @@ Do not invent tools. Do not answer from memory. If required information is missi
 
 Available tools:
 {tool_catalog}
+
+Access scope:
+{scope_rules}
 
 Previous conversation state:
 {conversation_state}
@@ -57,7 +60,7 @@ User message:
 JSON answer:"""
 
 planner_prompt = PromptTemplate(
-    input_variables=["message", "conversation_state", "tool_catalog"],
+    input_variables=["message", "conversation_state", "tool_catalog", "scope_rules"],
     template=PLANNER_TEMPLATE,
 )
 
@@ -597,7 +600,10 @@ def _rule_based_analytical_plan(message: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _rule_based_performance_plan(message: str) -> Optional[Dict[str, Any]]:
+def _rule_based_performance_plan(
+    message: str,
+    employee_scope: bool = False,
+) -> Optional[Dict[str, Any]]:
     lower = message.lower()
     if "performance" not in lower:
         return None
@@ -614,7 +620,9 @@ def _rule_based_performance_plan(message: str) -> Optional[Dict[str, Any]]:
     user_name = re.sub(r"\b(performance|summary|of|for|employee|report|show|give|me)\b", " ", user_name)
     user_name = re.sub(r"['’]s\b", "", user_name)
     user_name = re.sub(r"\s+", " ", user_name).strip()
-    if not user_name:
+    if employee_scope and user_name in {"me", "my", "mine", "myself", "my own"}:
+        user_name = "me"
+    if not user_name and not employee_scope:
         return {
             "needs_clarification": True,
             "clarification_question": "Which employee's performance should I summarize?",
@@ -622,16 +630,48 @@ def _rule_based_performance_plan(message: str) -> Optional[Dict[str, Any]]:
             "response_format": "clarification",
             "isNextPageRequest": False,
         }
+    performance_args: Dict[str, Any] = {"dateRangeText": date_range_text}
+    if user_name:
+        performance_args["userName"] = user_name
     return {
         "needs_clarification": False,
         "clarification_question": None,
         "tool_calls": [{
             "tool": "get_employee_performance",
-            "args": {"userName": user_name, "dateRangeText": date_range_text},
+            "args": performance_args,
         }],
         "response_format": "employee_performance",
         "isNextPageRequest": False,
     }
+
+
+def _rule_based_performance_follow_up_plan(
+    message: str,
+    previous_state: Dict[str, Any],
+    employee_scope: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not _detect_date_range_text(message.lower()):
+        return None
+    recent_turns = previous_state.get("recentTurns") or []
+    if not recent_turns:
+        return None
+    last_turn = recent_turns[-1]
+    last_text = str(last_turn.get("text") or "").lower()
+    if last_turn.get("role") != "assistant" or "which period" not in last_text or "performance" not in last_text:
+        return None
+    prior_request = next(
+        (
+            str(turn.get("text") or "")
+            for turn in reversed(recent_turns[:-1])
+            if turn.get("role") == "user" and "performance" in str(turn.get("text") or "").lower()
+        ),
+        "",
+    )
+    return (
+        _rule_based_performance_plan(f"{prior_request} {message}", employee_scope)
+        if prior_request
+        else None
+    )
 
 
 def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -708,7 +748,12 @@ def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Di
     }
 
 
-async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def run_planner_chain(
+    message: str,
+    previous_state: Optional[Dict[str, Any]] = None,
+    *,
+    employee_scope: bool = False,
+) -> Dict[str, Any]:
     if previous_state is None:
         previous_state = {}
 
@@ -730,14 +775,33 @@ async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any
     if person_status_plan:
         return person_status_plan
 
-    performance_plan = _rule_based_performance_plan(message)
+    performance_plan = _rule_based_performance_plan(message, employee_scope)
     if performance_plan:
         return performance_plan
+
+    performance_follow_up_plan = _rule_based_performance_follow_up_plan(
+        message,
+        previous_state,
+        employee_scope,
+    )
+    if performance_follow_up_plan:
+        return performance_follow_up_plan
 
     prompt = planner_prompt.format(
         message=message,
         conversation_state=json.dumps(previous_state, default=str),
-        tool_catalog=get_tool_catalog_for_prompt(),
+        tool_catalog=(
+            get_employee_tool_catalog()
+            if employee_scope
+            else get_tool_catalog_for_prompt()
+        ),
+        scope_rules=(
+            "Only plan operations for the logged-in employee's own tickets and performance. "
+            "Never substitute another employee. Requests about another employee must retain "
+            "the supplied userName so the tool boundary can deny them."
+            if employee_scope
+            else "Organization-wide admin access. Preserve the existing admin behavior."
+        ),
     )
 
     response_text = await call_llm_async(prompt)

@@ -1,4 +1,5 @@
 import asyncio
+import math
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from app.dashboard_chat.services.aspnet_client import aspnet_client
@@ -31,6 +32,7 @@ async def get_tickets(
     page_index: int = 1,
     page_size: int = 30,
     for_report: bool = False,
+    employee_scope: bool = False,
 ) -> Dict[str, Any]:
     """
     Fetches filtered tickets using the existing ASP.NET pagination API.
@@ -39,10 +41,13 @@ async def get_tickets(
     includes Pending on Server). For grouped analytics, for_report retrieves
     one complete filtered snapshot from that same API.
     """
+    if employee_scope:
+        page_size = 12
+
     base_payload = {
         "entityId": entity_id,
         "blockId": block_id,
-        "userId": assigned_to or (GLOBAL_DASHBOARD_USER_ID if status else user_id),
+        "userId": user_id if employee_scope else assigned_to or (GLOBAL_DASHBOARD_USER_ID if status else user_id),
         "keyword": ticket_no or keyword,
         "client": None,
         "project": project_id,
@@ -54,7 +59,10 @@ async def get_tickets(
         "statusFilter": None,
         "forReport": for_report,
     }
-    if status == "Re Open":
+    if employee_scope:
+        endpoint = "api/Dashboard/GetAllTicketsUserWise"
+        base_payload["status"] = status or "ALL"
+    elif status == "Re Open":
         endpoint = "api/TicketRegistration/GetAllReOpenPaginated"
         base_payload["status"] = None
     elif status:
@@ -62,7 +70,27 @@ async def get_tickets(
     else:
         endpoint = "api/TicketRegistration/GetAllPaginated"
 
-    if for_report:
+    if for_report and employee_scope:
+        first_page = await fetch_single_page(
+            {**base_payload, "pageIndex": 1, "pageSize": page_size},
+            endpoint,
+        )
+        responses = [first_page]
+        total_record = int(first_page.get("totalRecord") or first_page.get("TotalRecord") or 0)
+        page_count = math.ceil(total_record / page_size) if total_record else 1
+        if page_count > 1:
+            responses.extend(await asyncio.gather(*(
+                fetch_single_page(
+                    {**base_payload, "pageIndex": idx, "pageSize": page_size},
+                    endpoint,
+                )
+                for idx in range(2, page_count + 1)
+            )))
+        records = []
+        for response in responses:
+            records.extend(response.get("filteredRecord") or response.get("FilteredRecord") or [])
+        records = records[:total_record]
+    elif for_report:
         res = await fetch_single_page(
             {**base_payload, "pageIndex": 1, "pageSize": 10},
             endpoint,
@@ -154,3 +182,56 @@ async def get_ticket_history(ticket_id: str) -> List[Dict[str, Any]]:
         return response.json()
     except Exception:
         return []
+
+
+async def get_ticket_record(ticket_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch one ticket record so callers can enforce ownership before details."""
+    try:
+        response = await aspnet_client.get(f"api/TicketRegistration/GetTicketRegData/{ticket_id}")
+        data = response.json()
+        if not isinstance(data, dict):
+            return None
+        ticket = data.get("ticketData") or data.get("TicketData")
+        return ticket if isinstance(ticket, dict) else None
+    except Exception:
+        return None
+
+
+async def get_tickets_created_by_user(
+    *,
+    user_id: str,
+    entity_id: str,
+    block_id: str,
+    start_date: str,
+    end_date: str,
+) -> List[Dict[str, Any]]:
+    """Fetch and date-filter tickets created by one user."""
+    response = await aspnet_client.get(
+        f"api/TicketRegistration/GetAllByUserId/{user_id},{entity_id},{block_id}"
+    )
+    data = response.json()
+    if not isinstance(data, list):
+        raise RuntimeError("Created-ticket API returned an unexpected response shape")
+
+    start = datetime.fromisoformat(start_date).date()
+    end = datetime.fromisoformat(end_date).date()
+    tickets: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        created_value = row.get("createdDate") or row.get("CreatedDate")
+        if not created_value:
+            continue
+        try:
+            created = datetime.fromisoformat(str(created_value).replace("Z", "+00:00")).date()
+        except ValueError:
+            continue
+        if start <= created <= end:
+            tickets.append({
+                "ticketId": str(row.get("id") or row.get("Id") or ""),
+                "ticketNo": str(row.get("ticketNo") or row.get("TicketNo") or ""),
+                "status": row.get("status") or row.get("Status"),
+                "priority": row.get("priority") or row.get("Priority"),
+                "createdDate": created.isoformat(),
+            })
+    return tickets

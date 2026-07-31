@@ -31,22 +31,23 @@ answer_prompt = PromptTemplate(
     template=ANSWER_TEMPLATE
 )
 
-PERFORMANCE_SUMMARY_TEMPLATE = """You are an employee performance analyst for a ticketing system.
-Write a concise insight report from the PERFORMANCE DATA below.
+PERFORMANCE_SUMMARY_TEMPLATE = """You summarize an employee's ticket workload from the PERFORMANCE DATA below.
+This is a workload report, not a complete evaluation of employee performance.
 
 Rules:
 1. Use only the supplied PERFORMANCE DATA. Do not invent counts, dates, causes, trends, or employee facts.
-2. Do not repeat dashboard-card labels such as \"Total Assigned\", \"Active Load\", \"Raised Tickets\", \"Pending To Close\", or \"Pending On Server\" as a list. Explain what the numbers mean instead.
-3. Return 2-4 concise markdown bullet points. Focus on ratios, workload implications, follow-up priorities, and comparisons that can be calculated from the supplied values.
-4. When interpreting raisedTickets, state that it is an assumption (for example, \"assuming raised means initiated by the employee\").
-5. If workActivityAvailable is false, do not infer work activity, actions, or active days.
-6. Never include database IDs, employee IDs, internal identifiers, or data not in the payload.
-7. Provide analytics of the employee performance with some quantitive factors like percentage.
-8. Give a overall performance score from 10 to the employee.
-9. Use Neural tone to represent the data.
-
-
-
+2. Assigned tickets and created tickets are different populations. Discuss them separately and never divide one population by the other.
+3. Use the supplied analysis percentages; do not recalculate them or combine unrelated metrics.
+4. Mention the requested period only when period.appliedToData is true.
+5. Treat missing or null values as unavailable, never as zero.
+6. Do not infer productivity, quality, effort, causes, SLA compliance, or trends from ticket volume alone.
+7. Do not provide an overall score or rating because no approved scoring rubric is supplied.
+8. Do not merely restate ticket counts. Lead with what the percentages mean for resolution progress, remaining backlog, overdue exposure, and follow-up priority; use counts only as supporting evidence.
+9. Start with a markdown heading containing the employee name, then return exactly 4 concise markdown bullet points.
+10. Include at least two relevant percentages when assignedTickets.total is greater than zero.
+11. The final bullet must begin with **Conclusion:** and state the strongest evidence-backed workload conclusion plus the next follow-up priority.
+12. Compare assigned and created volume only using analysis.volumeComparison. State that the populations may overlap, so equal volumes do not prove self-assignment.
+13. Never include database IDs, employee IDs, internal identifiers, or data not in the payload.
 
 Output strictly as JSON with no other text:
 {{
@@ -63,25 +64,92 @@ performance_summary_prompt = PromptTemplate(
 )
 
 
+def _percentage(part: int, total: int) -> float | None:
+    return round(part * 100 / total, 1) if total else None
+
+
+def _performance_analysis(performance_data: Dict[str, Any]) -> Dict[str, Any]:
+    def section(name: str) -> Dict[str, Any]:
+        tickets = performance_data.get(name) or {}
+        total = max(0, int(tickets.get("total") or 0))
+        active = max(0, int(tickets.get("active") or 0))
+        resolved = max(0, int(tickets.get("completed") or 0)) + max(
+            0, int(tickets.get("closed") or 0)
+        )
+        overdue = max(0, int(tickets.get("overdue") or 0))
+        pending_server = max(0, int(tickets.get("pendingOnServer") or 0))
+        return {
+            "total": total,
+            "active": active,
+            "resolved": resolved,
+            "overdue": overdue,
+            "pendingOnServer": pending_server,
+            "resolutionRatePct": _percentage(resolved, total),
+            "activeRatePct": _percentage(active, total),
+            "overdueRatePct": _percentage(overdue, total),
+            "pendingServerShareOfActivePct": _percentage(pending_server, active),
+        }
+
+    assigned = section("assignedTickets")
+    created = section("createdTickets")
+    difference = created["total"] - assigned["total"]
+    relationship = "matched" if difference == 0 else "higher" if difference > 0 else "lower"
+    return {
+        "assigned": assigned,
+        "created": created,
+        "volumeComparison": {
+            "createdComparedWithAssigned": relationship,
+            "absoluteDifference": abs(difference),
+        },
+    }
+
+
 def _performance_summary_payload(performance_data: Dict[str, Any]) -> Dict[str, Any]:
     """Pass only display-safe, summary-relevant fields to the LLM."""
-    tickets = performance_data.get("tickets") or {}
+    period = performance_data.get("period") or {}
+
+    def ticket_section(name: str) -> Dict[str, Any]:
+        tickets = performance_data.get(name) or {}
+        return {
+            key: tickets.get(key)
+            for key in (
+                "total",
+                "active",
+                "completed",
+                "closed",
+                "overdue",
+                "pendingOnServer",
+            )
+        }
+
     return {
         "employeeName": performance_data.get("employeeName"),
         "designation": performance_data.get("designation"),
-        "startDate": performance_data.get("startDate"),
-        "endDate": performance_data.get("endDate"),
-        "workActivityAvailable": bool(performance_data.get("workActivityAvailable")),
-        "workActivityCount": performance_data.get("workActivityCount"),
-        "activeWorkDays": performance_data.get("activeWorkDays"),
-        "tickets": {
-            "activeTickets": tickets.get("activeTickets", 0),
-            "totalTickets": tickets.get("totalTickets", 0),
-            "raisedTickets": tickets.get("raisedTickets", 0),
-            "pendingToCloseTickets": tickets.get("pendingToCloseTickets", 0),
-            "pendingOnServer": tickets.get("pendingOnServer", 0),
+        "period": {
+            "startDate": period.get("startDate"),
+            "endDate": period.get("endDate"),
+            "appliedToData": period.get("appliedToData") is True,
         },
+        "assignedTickets": ticket_section("assignedTickets"),
+        "createdTickets": ticket_section("createdTickets"),
+        "analysis": _performance_analysis(performance_data),
     }
+
+
+def _is_analytical_performance_summary(message: str, performance_data: Dict[str, Any]) -> bool:
+    bullet_count = sum(
+        line.lstrip().startswith(("- ", "• "))
+        for line in message.splitlines()
+    )
+    assigned_total = (_performance_analysis(performance_data).get("assigned") or {}).get("total", 0)
+    employee_name = str(performance_data.get("employeeName") or "").strip()
+    return (
+        message.lstrip().startswith("### ")
+        and bullet_count == 4
+        and "**Conclusion:**" in message
+        and (not assigned_total or message.count("%") >= 2)
+        and (not employee_name or employee_name.lower() in message.lower())
+    )
 
 
 async def run_performance_summary_chain(performance_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -94,7 +162,7 @@ async def run_performance_summary_chain(performance_data: Dict[str, Any]) -> Dic
     try:
         result = json.loads(clean_json_response(response_text))
         message = result.get("message") if isinstance(result, dict) else None
-        if isinstance(message, str) and message.strip():
+        if isinstance(message, str) and _is_analytical_performance_summary(message.strip(), performance_data):
             return {"message": message.strip()}
     except (TypeError, ValueError, json.JSONDecodeError):
         pass

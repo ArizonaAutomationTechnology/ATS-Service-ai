@@ -1,6 +1,8 @@
+import asyncio
 import datetime
 from typing import List, Dict, Any
 from app.dashboard_chat.services.aspnet_client import aspnet_client
+from app.dashboard_chat.tools.ticket_tools import get_tickets, get_tickets_created_by_user
 
 async def get_active_users(entity_id: str, block_id: str) -> List[Dict[str, Any]]:
     """Fetches list of active users/employees for resolving names to user IDs."""
@@ -19,43 +21,134 @@ async def get_user_workloads() -> Dict[str, Any]:
         return {"data": [], "raisedData": []}
 
 
-async def get_employee_performance(
+async def get_user_ticket_counts(
     user_id: str,
-    user_name: str,
+    entity_id: str,
+    block_id: str,
+) -> Dict[str, Any]:
+    """Fetch ticket counts for exactly one employee and organization scope."""
+    try:
+        response = await aspnet_client.get(
+            f"api/Dashboard/GetUserTicketsCount/{user_id},{entity_id},{block_id}"
+        )
+        data = response.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ticket_summary(tickets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    statuses = {
+        "raised": 0,
+        "inProcess": 0,
+        "completed": 0,
+        "closed": 0,
+        "reopened": 0,
+        "rejected": 0,
+        "overdue": 0,
+        "pendingOnServer": 0,
+        "reopenPendingOnServer": 0,
+        "overduePendingOnServer": 0,
+        "other": 0,
+    }
+    status_map = {
+        "raised": "raised",
+        "in process": "inProcess",
+        "completed": "completed",
+        "closed": "closed",
+        "re open": "reopened",
+        "reopened": "reopened",
+        "rejected": "rejected",
+        "overdue": "overdue",
+        "pending on server": "pendingOnServer",
+        "reopen pending on server": "reopenPendingOnServer",
+        "overdue pending on server": "overduePendingOnServer",
+    }
+    for ticket in tickets:
+        status = str(ticket.get("status") or "").strip().lower()
+        statuses[status_map.get(status, "other")] += 1
+
+    active = sum(
+        statuses[key]
+        for key in (
+            "raised",
+            "inProcess",
+            "reopened",
+            "overdue",
+            "pendingOnServer",
+            "reopenPendingOnServer",
+            "overduePendingOnServer",
+        )
+    )
+    return {
+        "total": len(tickets),
+        "active": active,
+        "completed": statuses["completed"],
+        "closed": statuses["closed"],
+        "overdue": statuses["overdue"] + statuses["overduePendingOnServer"],
+        "pendingOnServer": (
+            statuses["pendingOnServer"]
+            + statuses["reopenPendingOnServer"]
+            + statuses["overduePendingOnServer"]
+        ),
+        "statusBreakdown": statuses,
+    }
+
+
+async def get_scoped_employee_performance(
+    *,
+    employee: Dict[str, Any],
+    user_id: str,
+    entity_id: str,
+    block_id: str,
     start_date: str,
     end_date: str,
 ) -> Dict[str, Any]:
-    """Fetch one employee's ticket metrics from the user-wise dashboard API."""
+    """Build a performance payload without loading any other employee's metrics."""
     start = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
     if end < start:
         raise ValueError("end_date must not be before start_date")
 
-    workloads = await get_user_workloads()
-    normalized_name = user_name.split("(", 1)[0].strip().lower()
+    assigned_result, created_tickets = await asyncio.gather(
+        get_tickets(
+            entity_id=entity_id,
+            block_id=block_id,
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            for_report=True,
+            employee_scope=True,
+        ),
+        get_tickets_created_by_user(
+            user_id=user_id,
+            entity_id=entity_id,
+            block_id=block_id,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+    )
+    assigned_tickets = assigned_result.get("tickets") or []
+    assigned_total = int(assigned_result.get("totalCount") or 0)
+    if assigned_total != len(assigned_tickets):
+        raise RuntimeError("Employee performance requires a complete assigned-ticket result")
 
-    def matching_metric(rows: Any) -> Dict[str, Any]:
-        for row in rows if isinstance(rows, list) else []:
-            metric_name = str(row.get("userName") or "").split("(", 1)[0].strip().lower()
-            if metric_name == normalized_name:
-                return row
-        return {}
-
-    workload = matching_metric(workloads.get("data"))
-    raised = matching_metric(workloads.get("raisedData"))
+    employee_name = (
+        employee.get("name")
+        or employee.get("Name")
+        or employee.get("userName")
+        or employee.get("UserName")
+        or "Employee"
+    )
+    designation = employee.get("designationName") or employee.get("DesignationName")
     return {
-        "employeeName": workload.get("userName") or raised.get("userName") or user_name,
-        "designation": workload.get("designation"),
-        "startDate": start_date,
-        "endDate": end_date,
-        "workActivityCount": None,
-        "activeWorkDays": None,
-        "workActivityAvailable": False,
-        "tickets": {
-            "activeTickets": workload.get("activeTickets", 0),
-            "totalTickets": workload.get("totalTickets", 0),
-            "pendingToCloseTickets": workload.get("pendingToCloseTickets", 0),
-            "pendingOnServer": workload.get("pendingOnServer", 0),
-            "raisedTickets": raised.get("raisedTickets", 0),
+        "employeeName": employee_name,
+        "designation": designation,
+        "period": {
+            "startDate": start_date,
+            "endDate": end_date,
+            "appliedToData": True,
         },
+        "assignedTickets": _ticket_summary(assigned_tickets),
+        "createdTickets": _ticket_summary(created_tickets),
     }
