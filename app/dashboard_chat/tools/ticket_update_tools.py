@@ -106,6 +106,7 @@ async def _resolve_ticket_id(
                 "message": f"I could not identify one ticket numbered **{ticket_no}**.",
             }
         ticket_id = _clean(matches[0].get("ticketId"))
+        args["ticketId"] = ticket_id
     return ticket_id, None
 
 
@@ -178,7 +179,9 @@ async def modify_ticket(
     description_action = _clean(args.get("descriptionAction")).lower()
     description_old_text = _clean(args.get("descriptionOldText"))
     description_new_text = _clean(args.get("descriptionNewText"))
-    if not description_action and (description_old_text or description_new_text):
+    if proposed["description"] and not (description_old_text or description_new_text):
+        description_action = "replace_all"
+    elif not description_action and (description_old_text or description_new_text):
         description_action = "replace_text"
     if description_action not in {"", "replace_all", "replace_text"}:
         return {

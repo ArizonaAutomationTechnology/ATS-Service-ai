@@ -106,6 +106,35 @@ TICKET_UPDATE_FIELDS = (
     "descriptionNewText",
 )
 TICKET_NUMBER_PATTERN = re.compile(r"\bATS-?\d+\b", re.IGNORECASE)
+BARE_TICKET_CREATE_REQUESTS = {
+    "raise ticket",
+    "raise a ticket",
+    "create ticket",
+    "create a ticket",
+    "open a ticket",
+    "log a ticket",
+    "submit a ticket",
+    "register a ticket",
+}
+BARE_TICKET_UPDATE_REQUESTS = {
+    "update ticket",
+    "update the ticket",
+    "update description"
+    "update category"
+    "update priority "
+    "modify ticket",
+    "modify the ticket",
+    "edit ticket",
+    "edit the ticket",
+    "change ticket",
+    "change the ticket",
+}
+TICKET_UPDATE_CONFIRMATIONS = {
+    "confirm",
+    "confirm update",
+    "confirm ticket update",
+    "yes confirm",
+}
 
 TICKET_UPDATE_TEMPLATE = """You extract fields for modifying one existing ticket.
 
@@ -163,7 +192,13 @@ def is_ticket_creation_request(message: str) -> bool:
 
 def is_ticket_update_request(message: str) -> bool:
     lower = " ".join((message or "").lower().split())
-    return bool(re.search(r"\b(modify|update|edit|change)\b.*\bticket\b", lower))
+    return bool(
+        re.search(r"\b(modify|update|edit|change)\b.*\bticket\b", lower)
+        or re.search(
+            r"\b(?:modify|update|edit|change|set)\b.*\b(?:ticket\s+)?description\b",
+            lower,
+        )
+    )
 
 
 def _strip_ticket_locator(description: str, ticket_no: str) -> str:
@@ -178,6 +213,32 @@ def _strip_ticket_locator(description: str, ticket_no: str) -> str:
     return locator.sub("", description).strip()
 
 
+def _explicit_description_change(message: str) -> Optional[Dict[str, str]]:
+    ticket_no_match = TICKET_NUMBER_PATTERN.search(message or "")
+    text = _strip_ticket_locator(
+        (message or "").strip(),
+        ticket_no_match.group(0) if ticket_no_match else "",
+    )
+    prefix = (
+        r"^(?:update|change|set|modify|edit)\s+(?:the\s+)?"
+        r"(?:ticket\s+)?description\s*(?:to|as|is|:)\s*"
+    )
+    targeted = re.match(prefix + r"(.+?)\s+instead\s+of\s+(.+?)\s*$", text, re.IGNORECASE)
+    if targeted:
+        return {
+            "descriptionAction": "replace_text",
+            "descriptionOldText": targeted.group(2).strip(),
+            "descriptionNewText": targeted.group(1).strip(),
+        }
+    complete = re.match(prefix + r"(.+?)\s*$", text, re.IGNORECASE)
+    if complete:
+        return {
+            "descriptionAction": "replace_all",
+            "description": complete.group(1).strip(),
+        }
+    return None
+
+
 async def _run_ticket_creation_plan(
     message: str,
     previous_state: Dict[str, Any],
@@ -187,18 +248,33 @@ async def _run_ticket_creation_plan(
         for key, value in (previous_state.get("ticketDraft") or {}).items()
         if key in TICKET_DRAFT_FIELDS and isinstance(value, str) and value.strip()
     }
-    prompt = ticket_draft_prompt.format(
-        message=message,
-        ticket_draft=json.dumps(existing),
-        recent_turns=json.dumps(previous_state.get("recentTurns") or []),
-    )
-    response_text = await call_llm_async(prompt)
-    try:
-        extracted = json.loads(clean_json_response(response_text))
-        if not isinstance(extracted, dict):
+    normalized_message = " ".join((message or "").lower().split()).strip(" .!?")
+    missing = [field for field in TICKET_DRAFT_FIELDS if field not in existing]
+    extracted: Dict[str, Any] = {}
+    if normalized_message in BARE_TICKET_CREATE_REQUESTS:
+        pass
+    elif normalized_message in {"high", "medium", "low"}:
+        extracted["priority"] = normalized_message.title()
+    elif missing == ["description"]:
+        extracted["description"] = re.sub(
+            r"^(?:ticket\s+)?description\s*(?:is|to|:)\s*",
+            "",
+            (message or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    else:
+        prompt = ticket_draft_prompt.format(
+            message=message,
+            ticket_draft=json.dumps(existing),
+            recent_turns=json.dumps(previous_state.get("recentTurns") or []),
+        )
+        response_text = await call_llm_async(prompt)
+        try:
+            extracted = json.loads(clean_json_response(response_text))
+            if not isinstance(extracted, dict):
+                extracted = {}
+        except Exception:
             extracted = {}
-    except Exception:
-        extracted = {}
 
     merged = dict(existing)
     for field in TICKET_DRAFT_FIELDS:
@@ -224,18 +300,40 @@ async def _run_ticket_update_plan(
         for key, value in (previous_state.get("ticketUpdateDraft") or {}).items()
         if key in TICKET_UPDATE_FIELDS and isinstance(value, str) and value.strip()
     }
-    prompt = ticket_update_prompt.format(
-        message=message,
-        ticket_update_draft=json.dumps(existing),
-        recent_turns=json.dumps(previous_state.get("recentTurns") or []),
+    normalized_message = " ".join((message or "").lower().split()).strip(" .!?")
+    bare_ticket_no = TICKET_NUMBER_PATTERN.fullmatch(normalized_message)
+    priority_match = re.fullmatch(
+        r"(?:(?:set|change|update|make)\s+(?:the\s+)?)?"
+        r"priority(?:\s+level)?\s*(?:to|as|is|:)?\s*(high|medium|low)",
+        normalized_message,
     )
-    response_text = await call_llm_async(prompt)
-    try:
-        extracted = json.loads(clean_json_response(response_text))
-        if not isinstance(extracted, dict):
-            extracted = {}
-    except Exception:
+    description_change = _explicit_description_change(message)
+    extracted: Dict[str, Any]
+    if normalized_message in BARE_TICKET_UPDATE_REQUESTS:
         extracted = {}
+    elif bare_ticket_no:
+        extracted = {"ticketNo": bare_ticket_no.group(0).upper()}
+    elif normalized_message in TICKET_UPDATE_CONFIRMATIONS:
+        extracted = {"confirm": True}
+    elif normalized_message in {"high", "medium", "low"}:
+        extracted = {"priority": normalized_message.title()}
+    elif priority_match:
+        extracted = {"priority": priority_match.group(1).title()}
+    elif description_change:
+        extracted = description_change
+    else:
+        prompt = ticket_update_prompt.format(
+            message=message,
+            ticket_update_draft=json.dumps(existing),
+            recent_turns=json.dumps(previous_state.get("recentTurns") or []),
+        )
+        response_text = await call_llm_async(prompt)
+        try:
+            extracted = json.loads(clean_json_response(response_text))
+            if not isinstance(extracted, dict):
+                extracted = {}
+        except Exception:
+            extracted = {}
 
     message_ticket_no = TICKET_NUMBER_PATTERN.search(message or "")
     if message_ticket_no:
@@ -614,10 +712,10 @@ async def run_planner_chain(message: str, previous_state: Optional[Dict[str, Any
     if previous_state is None:
         previous_state = {}
 
-    if previous_state.get("ticketUpdateDraft") or is_ticket_update_request(message):
+    if previous_state.get("ticketUpdateDraft") is not None or is_ticket_update_request(message):
         return await _run_ticket_update_plan(message, previous_state)
 
-    if previous_state.get("ticketDraft") or is_ticket_creation_request(message):
+    if previous_state.get("ticketDraft") is not None or is_ticket_creation_request(message):
         return await _run_ticket_creation_plan(message, previous_state)
 
     raised_count_plan = _rule_based_raised_count_plan(message)

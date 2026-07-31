@@ -66,6 +66,7 @@ def response_metadata(tool_results: list[Dict[str, Any]], args: Dict[str, Any]) 
 
 TICKET_DRAFT_FIELDS = ("projectName", "categoryName", "priority", "description")
 TICKET_UPDATE_FIELDS = (
+    "ticketId",
     "ticketNo",
     "projectName",
     "categoryName",
@@ -488,6 +489,8 @@ async def dashboard_chat(request: DashboardChatRequest):
 
     for result in tool_results:
         if result.get("type") == "clarification":
+            if result.get("tool") == "modify_ticket":
+                merge_ticket_update_draft(state, result.get("args") or {})
             state_store.add_turn(state, "user", request.message)
             state_store.add_turn(state, "assistant", result.get("message", "Please clarify your request."))
             state_store.set(conversation_id, state)

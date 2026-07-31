@@ -1,3 +1,5 @@
+import asyncio
+from difflib import get_close_matches
 from typing import Any, Dict, Iterable, Optional
 
 from app.dashboard_chat.services.aspnet_client import aspnet_client
@@ -36,12 +38,14 @@ def _resolve_named_row(
     query_value = _normalized(query, project=project)
     exact_matches = []
     partial_matches = []
+    names_by_normalized: Dict[str, list[str]] = {}
     for row in rows:
         name = _row_value(row, name_keys)
         row_id = _row_value(row, id_keys)
         if not name or not row_id:
             continue
         normalized_name = _normalized(name, project=project)
+        names_by_normalized.setdefault(normalized_name, []).append(str(name))
         if query_value == normalized_name:
             exact_matches.append((str(row_id), str(name)))
         elif query_value and query_value in normalized_name:
@@ -50,7 +54,20 @@ def _resolve_named_row(
     matches = exact_matches or partial_matches
     if len(matches) == 1:
         return matches[0][0], matches[0][1], []
-    return None, None, [name for _, name in matches[:5]]
+    suggestions = [name for _, name in matches[:5]]
+    if not suggestions and query_value:
+        close_names = get_close_matches(
+            query_value,
+            names_by_normalized,
+            n=5,
+            cutoff=0.6,
+        )
+        suggestions = [
+            name
+            for close_name in close_names
+            for name in names_by_normalized[close_name]
+        ][:5]
+    return None, None, suggestions
 
 
 def missing_ticket_fields(args: Dict[str, Any]) -> list[str]:
@@ -101,7 +118,10 @@ async def create_ticket(
         }
     draft["priority"] = priority
 
-    projects = await get_active_projects(entity_id, block_id)
+    projects, categories = await asyncio.gather(
+        get_active_projects(entity_id, block_id),
+        get_active_categories(entity_id, block_id),
+    )
     project_id, project_name, project_matches = _resolve_named_row(
         projects,
         draft["projectName"],
@@ -119,7 +139,6 @@ async def create_ticket(
             "message": f"I could not identify one active project named **{draft['projectName']}**.{suffix}",
         }
 
-    categories = await get_active_categories(entity_id, block_id)
     category_id, category_name, category_matches = _resolve_named_row(
         categories,
         draft["categoryName"],
