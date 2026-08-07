@@ -1,3 +1,4 @@
+import asyncio
 import re
 import json
 import logging
@@ -5,15 +6,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 import tempfile
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
-from sqlalchemy.orm import Session
 from app.config import settings
-from app.database import get_db
 from app.models.schemas import (
     PromptRequest, 
     AssistantResponse, 
-    DatabasePromptRequest, 
     AdminPromptRequest, 
     AdminAssistantResponse,
     SimilarTicketsRequest,
@@ -21,7 +19,7 @@ from app.models.schemas import (
     SimilarTicketMatch,
     AudioDescriptionResponse,
 )
-from app.services import ticket_service, prompt_service, llm_service, nl2sql_service, speech_service
+from app.services import ticket_service, prompt_service, llm_service, speech_service
 
 
 router = APIRouter(prefix="/api/assistant", tags=["assistant"])
@@ -156,14 +154,24 @@ async def create_ticket_description_from_audio(
     )
 
 @router.post("/ask", response_model=AssistantResponse)
-async def ask_assistant(request: PromptRequest, db: Session = Depends(get_db)):
+async def ask_assistant(request: PromptRequest):
     # 1. Scan user prompt for employee or assignment intent.
     # If the user is just summarizing the ticket description, we do NOT load the employee directory.
     # This prevents sending 41 employee records to the context window, dramatically speeding up CPU inference.
     needs_employees = needs_employee_context(request.prompt)
 
-    # 2. Retrieve ticket details (synchronous call, FastAPI executes this in a threadpool)
-    ticket = ticket_service.get_ticket_details(db, request.ticket_id)
+    # ATS data is intentionally fetched through the deployed ASP.NET API, not SQL.
+    try:
+        ticket = await ticket_service.get_ticket_details(
+            request.ticket_id,
+            request.entityId,
+            request.blockId,
+        )
+    except ticket_service.TicketApiError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The ATS API is temporarily unavailable.",
+        ) from exc
     if not ticket:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -174,8 +182,16 @@ async def ask_assistant(request: PromptRequest, db: Session = Depends(get_db)):
     employees = []
     workloads = []
     if needs_employees:
-        employees = ticket_service.get_all_employees(db)
-        workloads = ticket_service.get_employee_project_workloads(db)
+        try:
+            employees, workloads = await asyncio.gather(
+                ticket_service.get_all_employees(request.entityId, request.blockId),
+                ticket_service.get_employee_project_workloads(request.entityId, request.blockId),
+            )
+        except ticket_service.TicketApiError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="The ATS API is temporarily unavailable.",
+            ) from exc
     
     # 4. Assemble the prompt context
     full_prompt = prompt_service.assemble_prompt(ticket, employees, request.prompt, workloads)
@@ -187,17 +203,21 @@ async def ask_assistant(request: PromptRequest, db: Session = Depends(get_db)):
     return AssistantResponse(text=ai_response, status="success")
 
 @router.post("/similar-tickets", response_model=SimilarTicketsResponse)
-async def check_similar_tickets(request: SimilarTicketsRequest, db: Session = Depends(get_db)):
-    # 1. Fetch candidates from database
-    candidates = ticket_service.get_active_tickets_candidates(
-        db,
-        entity_id=request.entityId,
-        block_id=request.blockId,
-        client_id=request.clientId,
-        project_id=request.projectId
-    )
+async def check_similar_tickets(request: SimilarTicketsRequest):
+    try:
+        candidates = await ticket_service.get_active_tickets_candidates(
+            entity_id=request.entityId,
+            block_id=request.blockId,
+            client_id=request.clientId,
+            project_id=request.projectId,
+        )
+    except ticket_service.TicketApiError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The ATS API is temporarily unavailable.",
+        ) from exc
     
-    # If no active candidates in database, return immediately
+    # If the ATS API has no active candidates, return immediately.
     if not candidates:
         return SimilarTicketsResponse(hasSimilarTickets=False, matches=[])
         
@@ -235,7 +255,7 @@ async def check_similar_tickets(request: SimilarTicketsRequest, db: Session = De
             
             if t_id in candidate_map and (similar_flag is True or similarity >= 0.75):
                 candidate = candidate_map[t_id]
-                # Build match using database values where possible to guarantee accuracy, 
+                # Build matches from authoritative ASP.NET API values.
                 # but similarity and reason come from LLM
                 validated_matches.append(
                     SimilarTicketMatch(
@@ -275,10 +295,17 @@ async def check_similar_tickets(request: SimilarTicketsRequest, db: Session = De
         matches=matches
     )
 @router.post("/admin/ask", response_model=AdminAssistantResponse)
-async def ask_admin_assistant(request: AdminPromptRequest, db: Session = Depends(get_db)):
-
-    # 1. Retrieve all workloads from database
-    workloads = ticket_service.get_employee_project_workloads(db)
+async def ask_admin_assistant(request: AdminPromptRequest):
+    try:
+        workloads = await ticket_service.get_employee_project_workloads(
+            request.entityId,
+            request.blockId,
+        )
+    except ticket_service.TicketApiError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The ATS API is temporarily unavailable.",
+        ) from exc
     
     # 2. Assemble the prompt context
     full_prompt = prompt_service.format_admin_prompt(workloads, request.Prompt)
@@ -291,12 +318,3 @@ async def ask_admin_assistant(request: AdminPromptRequest, db: Session = Depends
     
     # 5. Return response matching exact schemas keys
     return AdminAssistantResponse(Success=success, Response=ai_response)
-
-# @router.post("/query-db", response_model=AssistantResponse)
-# async def query_database(request: DatabasePromptRequest, db: Session = Depends(get_db)):
-#     """
-#     Translates the natural language query into SQL, executes it against the database, 
-#     and returns a summary explanation generated by the LLM.
-#     """
-#     response_text = await nl2sql_service.execute_natural_query(db, request.prompt)
-#     return AssistantResponse(text=response_text, status="success")

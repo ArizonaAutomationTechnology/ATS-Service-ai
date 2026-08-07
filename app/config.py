@@ -5,10 +5,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
-    DATABASE_URL: str = os.getenv(
-        "DATABASE_URL",
-        "mssql+pyodbc:///?odbc_connect=DRIVER%3D%7BODBC+Driver+17+for+SQL+Server%7D%3BSERVER%3DDESKTOP-AIT044%3BDATABASE%3DATSDB%3BTrusted_Connection%3Dyes%3BTrustServerCertificate%3Dyes"
-    )
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma4:cloud")
     OLLAMA_API_KEY: str = os.getenv("OLLAMA_API_KEY", "")

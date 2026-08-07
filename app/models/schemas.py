@@ -5,16 +5,17 @@ from pydantic import BaseModel, Field
 class PromptRequest(BaseModel):
     ticket_id: str = Field(..., description="The UUID of the ticket as a string")
     prompt: str = Field(..., description="The user's prompt or request for the assistant")
+    entityId: str = Field(..., description="The GUID of the Entity")
+    blockId: str = Field(..., description="The GUID of the Block")
 
 class AssistantResponse(BaseModel):
     text: str = Field(..., description="The generated response text from the AI Assistant")
     status: str = Field("success", description="The status of the request (e.g., success, error)")
 
-class DatabasePromptRequest(BaseModel):
-    prompt: str = Field(..., description="The natural language question about the ticket database")
-
 class AdminPromptRequest(BaseModel):
     Prompt: str = Field(..., description="The admin's prompt asking about employee workloads")
+    entityId: str = Field(..., description="The GUID of the Entity")
+    blockId: str = Field(..., description="The GUID of the Block")
 
 class AdminAssistantResponse(BaseModel):
     Success: bool = Field(..., description="Success flag")
