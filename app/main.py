@@ -49,6 +49,7 @@ app = FastAPI(
     description="FastAPI service for ticket description summarization and assignment recommendations.",
     version="1.0.0",
     lifespan=lifespan,
+    openapi_url=None if os.getenv("RENDER") else "/openapi.json",
 )
 
 # CORS middleware configurations to allow Angular frontend calls
