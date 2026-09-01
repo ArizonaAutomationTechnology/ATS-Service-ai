@@ -332,6 +332,45 @@ def format_employee_performance(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def format_employee_workload(data: Dict[str, Any]) -> Dict[str, Any]:
+    total = int(data.get("totalAssigned") or 0)
+    in_process = int(data.get("inProcess") or 0)
+    reopened = int(data.get("reopened") or 0)
+    overdue = int(data.get("overdue") or 0)
+    completed = int(data.get("completed") or 0)
+    closed = int(data.get("closed") or 0)
+    active = in_process + reopened + overdue
+    resolved = completed + closed
+    as_of_date = data.get("asOfDate") or "today"
+
+    if not total:
+        return {
+            "message": (
+                f"### Today's workload — {as_of_date}\n"
+                "- No assigned tickets were found in the current workload snapshot."
+            ),
+        }
+
+    active_rate = round(active * 100 / total, 1)
+    resolved_rate = round(resolved * 100 / total, 1)
+    conclusion = (
+        "There is no reopened or overdue backlog; follow-up is concentrated on the in-process queue."
+        if not reopened and not overdue
+        else "Reopened and overdue tickets should be prioritized within the active queue."
+    )
+    return {
+        "message": (
+            f"### Today's workload — {as_of_date}\n"
+            f"- **Current assigned snapshot:** **{total}** tickets across the tracked workload statuses.\n"
+            f"- **Needs attention:** **{active}** tickets (**{active_rate}%**) — "
+            f"{in_process} in process or pending on server, {reopened} reopened, and {overdue} overdue.\n"
+            f"- **Resolved status:** **{resolved}** tickets (**{resolved_rate}%**) — "
+            f"{completed} completed and {closed} closed.\n"
+            f"- **Conclusion:** {conclusion}"
+        ),
+    }
+
+
 def is_count_only_query(query: str) -> bool:
     lower = (query or "").lower()
     count_terms = ["how many", "count", "total", "number of"]
@@ -634,6 +673,8 @@ async def handle_dashboard_chat(
         answer_res = format_ticket_created(tool_data)
     elif kind == "monthly_ticket_count" and isinstance(tool_data, dict):
         answer_res = format_monthly_ticket_count(tool_data)
+    elif kind == "employee_workload" and isinstance(tool_data, dict):
+        answer_res = format_employee_workload(tool_data)
     elif kind == "employee_performance" and isinstance(tool_data, dict):
         answer_res = format_employee_performance(tool_data)
     elif kind == "ticket_list" and isinstance(tool_data, dict):

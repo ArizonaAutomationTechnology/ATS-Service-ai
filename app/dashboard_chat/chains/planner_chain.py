@@ -674,6 +674,34 @@ def _rule_based_performance_follow_up_plan(
     )
 
 
+def _rule_based_employee_workload_plan(
+    message: str,
+    employee_scope: bool = False,
+) -> Optional[Dict[str, Any]]:
+    lower = message.lower().replace("’", "'")
+    if not employee_scope or "workload" not in lower:
+        return None
+    if re.search(r"\b(?!today\b)[a-z]+(?:\s+[a-z]+)?'s\s+workload\b", lower):
+        return None
+    is_own_snapshot = (
+        re.search(r"\bmy\s+(?:current\s+|today'?s\s+)?workload\b", lower)
+        or re.search(r"\b(?:today'?s?|current)\s+workload\b", lower)
+        or re.search(r"\bworkload\s+(?:for\s+)?(?:me|today)\b", lower)
+    )
+    if not is_own_snapshot:
+        return None
+    return {
+        "needs_clarification": False,
+        "clarification_question": None,
+        "tool_calls": [{
+            "tool": "get_dashboard_counts",
+            "args": {"metric": "current_workload"},
+        }],
+        "response_format": "employee_workload",
+        "isNextPageRequest": False,
+    }
+
+
 def _fallback_plan(message: str, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     lower = message.lower()
     if "next" in lower and previous_state and previous_state.get("lastTool"):
@@ -786,6 +814,10 @@ async def run_planner_chain(
     )
     if performance_follow_up_plan:
         return performance_follow_up_plan
+
+    employee_workload_plan = _rule_based_employee_workload_plan(message, employee_scope)
+    if employee_workload_plan:
+        return employee_workload_plan
 
     prompt = planner_prompt.format(
         message=message,

@@ -15,6 +15,7 @@ from app.dashboard_chat.tools.ticket_tools import get_ticket_history, get_ticket
 from app.dashboard_chat.tools.ticket_update_tools import modify_ticket
 from app.dashboard_chat.tools.user_tools import (
     get_active_users,
+    get_employee_current_workload,
     get_scoped_employee_performance,
     get_user_ticket_counts,
     get_user_workloads,
@@ -85,7 +86,7 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "name": "get_dashboard_counts",
-        "description": "Fetch dashboard status totals such as all, raised, in-process, completed, closed, reopened, overdue, and rejected ticket counts.",
+        "description": "Fetch dashboard status totals. For the logged-in employee's today/current workload snapshot, use metric=current_workload.",
         "args": ["metric", "dateRangeText", "startDate", "endDate"],
         "returns": "counts",
     },
@@ -614,6 +615,14 @@ async def execute_tool(
 
     if tool_name == "get_dashboard_counts":
         if employee_scope:
+            if args.get("metric") == "current_workload":
+                return {
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "kind": "employee_workload",
+                    "args": args,
+                    "data": await get_employee_current_workload(user_id, entity_id, block_id),
+                }
             if args.get("metric") == "monthly_volume":
                 start_date = args.get("startDate")
                 end_date = args.get("endDate")

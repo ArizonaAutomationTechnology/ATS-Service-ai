@@ -37,6 +37,33 @@ async def get_user_ticket_counts(
         return {}
 
 
+async def get_employee_current_workload(
+    user_id: str,
+    entity_id: str,
+    block_id: str,
+) -> Dict[str, Any]:
+    """Return only the employee-assigned fields from the current dashboard snapshot."""
+    response = await aspnet_client.get(
+        f"api/Dashboard/GetAllTicketCount/{user_id},{entity_id},{block_id}"
+    )
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Employee workload API returned an unexpected response shape")
+
+    workload = {
+        "inProcess": int(data.get("inProcessTicketswihtUserId") or 0),
+        "completed": int(data.get("completedTicketsDashboardTL") or 0),
+        "closed": int(data.get("closedTicketsDashboardTL") or 0),
+        "reopened": int(data.get("reOpenTicketswihtUserId") or 0),
+        "overdue": int(data.get("overdueTicketsTL") or 0),
+    }
+    return {
+        "asOfDate": datetime.date.today().isoformat(),
+        "totalAssigned": sum(workload.values()),
+        **workload,
+    }
+
+
 def _ticket_summary(tickets: List[Dict[str, Any]]) -> Dict[str, Any]:
     statuses = {
         "raised": 0,
