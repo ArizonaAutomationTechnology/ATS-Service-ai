@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from pydantic import BaseModel, ConfigDict
 from starlette.concurrency import run_in_threadpool
 from app.config import settings
 from app.models.schemas import (
@@ -33,12 +34,6 @@ _AUDIO_SUFFIXES = {
     "audio/webm": ".webm",
     "audio/x-wav": ".wav",
 }
-_DESCRIPTION_SCHEMA = {
-    "type": "object",
-    "properties": {"description": {"type": "string"}},
-    "required": ["description"],
-    "additionalProperties": False,
-}
 _ASSIGNMENT_WORDS = (
     "assign",
     "assignment",
@@ -55,6 +50,12 @@ _ASSIGNMENT_WORDS = (
     "employee",
     "people",
 )
+
+
+class _PolishedTicketDescription(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str
 
 
 def needs_employee_context(prompt: str) -> bool:
@@ -135,10 +136,10 @@ async def create_ticket_description_from_audio(
     polished_description: str | None = None
     try:
         prompt = prompt_service.format_ticket_description_polish_prompt(translation.text, project_context)
-        result = await llm_service.call_llm_json_async(prompt, _DESCRIPTION_SCHEMA)
+        result = await llm_service.call_llm_json_async(prompt, _PolishedTicketDescription)
         description = result.get("description")
         if not isinstance(description, str) or not description.strip():
-            raise llm_service.LlmServiceError("Ollama returned an empty ticket description.")
+            raise llm_service.LlmServiceError("The model returned an empty ticket description.")
         polished_description = description.strip()
     except llm_service.LlmServiceError as exc:
         logger.warning("Ticket-description polishing unavailable: %s", exc)

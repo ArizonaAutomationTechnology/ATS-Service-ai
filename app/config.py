@@ -5,10 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
-    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma4:cloud")
-    OLLAMA_API_KEY: str = os.getenv("OLLAMA_API_KEY", "")
-    OLLAMA_TIMEOUT_SECONDS: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "300"))
     PORT: int = int(os.getenv("PORT", "8000"))
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "medium")
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")
@@ -16,8 +15,8 @@ class Settings:
     MAX_AUDIO_BYTES: int = int(os.getenv("MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))
     MAX_AUDIO_DURATION_SECONDS: int = int(os.getenv("MAX_AUDIO_DURATION_SECONDS", "120"))
     MAX_TRANSCRIPT_CHARS: int = int(os.getenv("MAX_TRANSCRIPT_CHARS", "12000"))
-    OLLAMA_DESCRIPTION_TIMEOUT_SECONDS: float = float(
-        os.getenv("OLLAMA_DESCRIPTION_TIMEOUT_SECONDS", "90")
+    GEMINI_DESCRIPTION_TIMEOUT_SECONDS: float = float(
+        os.getenv("GEMINI_DESCRIPTION_TIMEOUT_SECONDS", "90")
     )
     
     # Dashboard AI Chat settings

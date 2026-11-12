@@ -52,6 +52,6 @@ class AudioDescriptionResponse(BaseModel):
     translatedText: str = Field(..., description="English text translated from the recording")
     polishedDescription: Optional[str] = Field(
         None,
-        description="Ollama-polished ticket description; null when polishing is unavailable",
+        description="AI-polished ticket description. Null when polishing is unavailable.",
     )
     warnings: list[str] = Field(default_factory=list, description="Non-blocking processing warnings")

@@ -1,39 +1,41 @@
 import json
+import logging
 import re
 from functools import lru_cache
 from typing import Any
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel
 
 from app.config import settings
 
 
+logger = logging.getLogger(__name__)
+
+
 class LlmServiceError(RuntimeError):
-    """Raised when Ollama cannot produce a usable response."""
+    """Raised when the model cannot produce a usable response."""
 
 
 @lru_cache(maxsize=4)
 def get_chat_model(
     temperature: float = 0.8,
     timeout_seconds: float | None = None,
-) -> ChatOllama:
-    """Return the shared LangChain chat model for the configured Ollama server."""
-    client_kwargs: dict[str, Any] = {
-        "timeout": timeout_seconds or settings.OLLAMA_TIMEOUT_SECONDS,
-    }
-    if settings.OLLAMA_API_KEY:
-        client_kwargs["headers"] = {
-            "Authorization": f"Bearer {settings.OLLAMA_API_KEY}",
-        }
+) -> ChatGoogleGenerativeAI:
+    """Return the shared chat model on the Gemini Developer API."""
+    api_key = settings.GEMINI_API_KEY.strip()
+    if not api_key:
+        raise LlmServiceError("Set GEMINI_API_KEY to enable model requests.")
 
-    return ChatOllama(
-        model=settings.OLLAMA_MODEL,
-        base_url=settings.OLLAMA_URL,
+    return ChatGoogleGenerativeAI(
+        model=settings.GEMINI_MODEL,
+        api_key=api_key,
+        vertexai=False,
+        api_version="v1beta",
         temperature=temperature,
-        num_ctx=4096,
-        client_kwargs=client_kwargs,
+        timeout=timeout_seconds or settings.GEMINI_TIMEOUT_SECONDS,
     )
 
 
@@ -55,31 +57,24 @@ def parse_json_content(content: str) -> dict[str, Any]:
 
 
 async def call_llm_async(prompt: str) -> str:
-    """Generate a non-streaming response through LangChain's ChatOllama."""
+    """Generate a non-streaming text response through the shared model."""
     try:
         return (await get_text_chain().ainvoke({"prompt": prompt})).strip()
-    except Exception as exc:
+    except LlmServiceError as exc:
         return f"Error communicating with LLM service: {exc}"
-
-
-async def call_llm_json_async(prompt: str, response_schema: dict) -> dict:
-    """Generate a schema-constrained response through LangChain's ChatOllama."""
-    chat_prompt = ChatPromptTemplate.from_messages([("human", "{prompt}")])
-    structured_model = get_chat_model(
-        0.2,
-        settings.OLLAMA_DESCRIPTION_TIMEOUT_SECONDS,
-    ).with_structured_output(
-        response_schema,
-        method="json_schema",
-    )
-    try:
-        result = await (chat_prompt | structured_model).ainvoke({"prompt": prompt})
-        if hasattr(result, "model_dump"):
-            result = result.model_dump()
-        if isinstance(result, str):
-            result = parse_json_content(result)
     except Exception as exc:
-        raise LlmServiceError("Ollama could not generate a structured response.") from exc
-    if not isinstance(result, dict):
-        raise LlmServiceError("Ollama returned an invalid structured response.")
-    return result
+        logger.warning("Gemini request failed (%s).", type(exc).__name__)
+        return "Error communicating with LLM service: Gemini request failed."
+
+
+async def call_llm_json_async(prompt: str, response_schema: type[BaseModel]) -> dict[str, Any]:
+    """Request JSON from Gemma and validate the response against the supplied model."""
+    try:
+        model = get_chat_model(0.2, settings.GEMINI_DESCRIPTION_TIMEOUT_SECONDS)
+        schema = json.dumps(response_schema.model_json_schema())
+        result = await (model | StrOutputParser()).ainvoke(f"{prompt}\n\nJSON schema:\n{schema}")
+        return response_schema.model_validate(parse_json_content(result), strict=True).model_dump()
+    except LlmServiceError:
+        raise
+    except Exception as exc:
+        raise LlmServiceError("Gemini could not generate a valid structured response.") from exc

@@ -21,3 +21,4 @@ app/plan.md
 app/services/plan.md
 app/services/nl2sql_service.py
 .vs/
+Speech-to-Text.py
