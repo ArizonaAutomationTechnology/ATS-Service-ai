@@ -6,8 +6,7 @@ from typing import Any
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-# from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel
 
 from app.config import settings
@@ -24,20 +23,19 @@ class LlmServiceError(RuntimeError):
 def get_chat_model(
     temperature: float = 0.8,
     timeout_seconds: float | None = None,
-) -> ChatOpenAI:
+) -> ChatGoogleGenerativeAI:
     """Return the shared chat model on the Gemini Developer API."""
-    api_key = settings.OPENAI_API_KEY.strip()
+    api_key = settings.GEMINI_API_KEY.strip()
     if not api_key:
-        raise LlmServiceError("Set OPENAI_API_KEY to enable model requests.")
+        raise LlmServiceError("Set GEMINI_API_KEY to enable model requests.")
 
-    return ChatOpenAI(
-        model=settings.OPENAI_MODEL,
+    return ChatGoogleGenerativeAI(
+        model=settings.GEMINI_MODEL,
         api_key=api_key,
-        base_url=settings.OPENAI_BASE_URL,
-        # vertexai=False,
-        # api_version="v1beta",
+        vertexai=False,
+        api_version="v1beta",
         temperature=temperature,
-        timeout=timeout_seconds or settings.OPENAI_TIMEOUT_SECONDS,
+        timeout=timeout_seconds or settings.GEMINI_TIMEOUT_SECONDS,
     )
 
 

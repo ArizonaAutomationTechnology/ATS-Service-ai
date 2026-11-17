@@ -5,13 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
-    # GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
-    # GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    # GEMINI_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "300"))
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_TIMEOUT_SECONDS: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "300"))
-    OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "300"))
     PORT: int = int(os.getenv("PORT", "8000"))
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "medium")
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")
